@@ -1,0 +1,917 @@
+---
+title: "Transcriptomic Profiling"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(readr)
+library(purrr)
+library(tidyverse)
+library(PCAtools)
+library(limma)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(pheatmap)
+library(survival)
+library(survminer)
+library(emmeans)
+library(broom)
+library(DOSE)
+library(enrichplot)
+library(ggsci)
+library(viridis)
+knitr::opts_chunk$set(echo = TRUE)
+
+# define working directory path
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/"
+
+# laod
+#load("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/transcriptomics/Array.analysis.data.RData")
+```
+
+```{r prep_gmt}
+## Prep gene sets for GSEA 
+mypath <- paste0(workPath, "transcriptomics/gmt/")
+setwd(mypath)
+files <- list.files(mypath, pattern ="*.gmt")
+df <- map(files, .f=read.gmt)
+gmt <- do.call(rbind,df)
+gmt$term <- tolower(gmt$term)
+# get gene entrezid
+df <- bitr(gmt$gene, fromType = "SYMBOL",toType = c("ENTREZID"), OrgDb = org.Hs.eg.db) %>% 
+  drop_na() %>% dplyr::rename(gene = SYMBOL)
+gmt <- dplyr::left_join(gmt,df) %>% dplyr::select(-c(gene)) %>% dplyr::rename(gene = ENTREZID)
+
+## Read gene annotation
+gL <- read.csv(paste0(workPath,"gene.length/hg38.gene.anno.csv"))
+```
+
+```{r prep metadata}
+# laod
+#load("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/transcriptomics/Array.data.RData")
+
+METADATA$sex[METADATA$sex == "F"] <- "Female"
+METADATA$sex[METADATA$sex == "female"] <- "Female"
+METADATA$sex[METADATA$sex == "male"] <- "Male"
+METADATA$sex[METADATA$sex == "M"] <- "Male"
+METADATA <- METADATA %>% dplyr::filter(sex %in% c("Female","Male"))
+METADATA$age[METADATA$age == "ND"] <- 0
+METADATA$age[METADATA$age == "NA"] <- 0
+METADATA <- METADATA %>% dplyr::filter(age > 10)
+# Filter weird geoids
+METADATA <- METADATA %>% dplyr::filter(!geoid %in% c("GSE84422-GPL97","GSE13214","GSE48350",
+                                               "GSE13507","GSE77952","GSE5787,GSE67522",
+                                               "GSE58394", "GSE42284","GSE28000-GPL4133",
+                                             "GSE52009","GSE109857","GSE50025-GPL13938",
+                                             "GSE117973","GSE39366","GSE65637","GSE49997","GSE73614")) %>% 
+  dplyr::filter(!disease %in% c("Bladder", "Cervical","Kidney","Ovarian"))
+pheno <- METADATA %>% dplyr::select(-c("group"))
+pheno <- pheno[!duplicated(pheno$id),]  #remove duplicates
+#pheno$id <- as.factor(pheno$id)
+```
+
+```{r prep counts}
+COUNTS.DATA <- COUNTS.DATA %>% remove_rownames() %>% column_to_rownames("Gene")
+COUNTS.DATA <- as.data.frame(t(COUNTS.DATA))
+ZCOUNTS.DATA <- ZCOUNTS.DATA %>% remove_rownames() %>% column_to_rownames("Gene")
+ZCOUNTS.DATA <- as.data.frame(t(ZCOUNTS.DATA))
+# match colnames with pheno
+idx <- match(pheno$id,rownames(COUNTS.DATA))
+COUNTS.DATA <- COUNTS.DATA[idx,]
+idx <- match(pheno$id,rownames(ZCOUNTS.DATA))
+ZCOUNTS.DATA <- ZCOUNTS.DATA[idx,]
+
+COUNTS.DATA <- as.data.frame(t(COUNTS.DATA))  # put to wider/transpose
+ZCOUNTS.DATA <- as.data.frame(t(ZCOUNTS.DATA)) 
+# replace NAs with 0 and remove unknow columns
+COUNTS.DATA[is.na(COUNTS.DATA)] <- 0
+COUNTS.DATA <- COUNTS.DATA %>% dplyr::select(contains("GSM"))
+ZCOUNTS.DATA[is.na(ZCOUNTS.DATA)] <- 0
+ZCOUNTS.DATA <- ZCOUNTS.DATA %>% dplyr::select(contains("GSM"))
+# normalie cts
+NORM.CTS <- as.data.frame(normalizeBetweenArrays(COUNTS.DATA))
+# match pheno with cts columns
+pheno <- pheno %>% dplyr::filter(id %in% colnames(COUNTS.DATA))
+# final pheno prep
+pheno$tissue <- as.factor(pheno$tissue)
+pheno$age <- as.numeric(pheno$age)
+pheno$sex <- as.factor(pheno$sex)
+pheno$geoid <- as.factor(pheno$geoid)
+pheno$disease <- as.factor(pheno$disease)
+pheno$Class <- as.factor(pheno$Class)
+```
+
+# AD vs Tumor
+## DEG analysis
+```{r DEG analysis, fig.height=8, fig.width=10.5, message=FALSE,warning=FALSE}
+# Prep AD data
+meta = pheno %>% column_to_rownames(var="id") %>% dplyr::filter(disease != "PD")
+idx <- match(rownames(meta),colnames(NORM.CTS))
+df <- NORM.CTS[,idx] #%>% drop_na()
+all(rownames(meta) == colnames(df))
+
+# prepare expresseion set
+d0 <- ExpressionSet(as.matrix(df))
+gg <- data.frame(Gene = rownames(df))
+rownames(gg) <- rownames(df)
+d0@featureData@data <- gg
+d0@phenoData@data <- meta
+d0@phenoData@data$Class  <- factor(d0@phenoData@data$Class , levels = c("Tumor","Neurodegeneration"))
+# design matrix
+design <- model.matrix(~d0@phenoData@data$Class + d0@phenoData@data$disease + 
+                         d0@phenoData@data$age + d0@phenoData@data$sex +
+                         d0@phenoData@data$tissue)
+# testing DEGs
+fit<-lmFit(d0,design) # fit model
+# Specify comparison of interest
+#contr <- makeContrasts("d0@phenoData@data$ClassNeurodegeneration" - "d0@phenoData@data$ClassTumor",levels = c("d0@phenoData@data$ClassTumor","d0@phenoData@data$ClassNeurodegeneration",))
+#Estimate contrast for each gene
+#tmp <- contrasts.fit(fit, contr)
+#tmp <- eBayes(tmp)
+fit<- eBayes(fit,robust=TRUE)
+results<- decideTests(fit, adjust.method = "fdr",p.value = 0.001,method="separate")
+summary(results)
+plotMD(fit,coef="d0@phenoData@data$ClassNeurodegeneration",status=results)
+deg <- topTable(fit,coef="d0@phenoData@data$ClassNeurodegeneration",sort.by = "logFC", confint = T,
+                adjust.method = "fdr",n=nrow(d0)) %>% #dplyr::filter(adj.P.Val != 0) %>% 
+   remove_rownames() %>% dplyr::select(c(Gene,logFC,CI.L,CI.R,adj.P.Val)) 
+deg[deg ==""] <- NA
+deg <- drop_na(deg)
+colnames(deg) <- c('Gene','logFC','CI.L','CI.R','FDR')
+deg <- deg[!duplicated(deg$Gene),]
+```
+
+```{r heatmap & refilter with z-score}
+# define signficance
+df <- deg
+df$effect <- 'NS'
+df$effect[df$logFC > 1.5 & df$CI.L > 1 & df$FDR < 0.05] <- "High in TG"
+df$effect[df$logFC < -1.5 & df$CI.R < -1 & df$FDR  < 0.05] <- "High in ND"
+df <- dplyr::filter(df, effect != "NS")
+# get z-score data
+df.z <- ZCOUNTS.DATA %>% rownames_to_column("Gene") %>% 
+  dplyr::filter(Gene %in% df[["Gene"]]) %>% 
+  column_to_rownames("Gene")
+idx <- match(rownames(meta),colnames(df.z))
+df.z <- df.z[,idx] #%>% drop_na()
+all(rownames(meta) == colnames(df.z))
+# Heatmap
+meta1 <- dplyr::select(meta,-c(geoid,tissue))
+set.seed(158)
+deg.z.hm.1 <- pheatmap::pheatmap(df.z, show_rownames = T, show_colnames = F,
+          annotation_col = meta1, cluster_cols = T,color = viridis(200),
+         cluster_rows = T, name = "z-score", kmeans_k = 30)
+# subset clusters 8,15,29,9,25,16,27,10,6
+clus <- as.data.frame(deg.z.hm.1[["kmeans"]][["cluster"]])
+clus.df <- clus %>% filter(clus$`deg.z.hm.1[["kmeans"]][["cluster"]]` 
+                           %in% c(8,15,29,9,25,16,27,10,6)) %>% 
+  rownames_to_column("Gene") %>% dplyr::select(-c(2))
+# replot heatmap
+df.z <- df.z %>% rownames_to_column("Gene") %>% 
+  dplyr::filter(Gene %in% clus.df[["Gene"]]) %>% 
+  column_to_rownames("Gene")
+set.seed(171)
+deg.z.hm.2 <- pheatmap::pheatmap(df.z, show_rownames = T, show_colnames = F,
+          annotation_col = meta1, cluster_cols = T,color = viridis(200),
+         cluster_rows = T, name = "z-score", kmeans_k = 3)
+# Get genes in all clusters
+clus <- as.data.frame(deg.z.hm.2[["kmeans"]][["cluster"]])
+```
+
+## X'terize DEGs
+```{r heatmap & volcano}
+## Heatmap
+# subset cluster 1
+clus.deg.df <- clus %>% filter(clus$`deg.z.hm.2[["kmeans"]][["cluster"]]`
+                           %in% c(1,2,3)) %>%
+  rownames_to_column("Gene") %>% dplyr::select(-c(2))
+## Volcano
+clus.deg.df$change <- "signif"
+clus.deg.df.vc <- deg %>% dplyr::left_join(clus.deg.df)
+# prep fo volcano
+clus.deg.df.vc$effect <- 'NS'
+clus.deg.df.vc$effect[clus.deg.df.vc$logFC > 1.5 & clus.deg.df.vc$CI.L > 1 & 
+                     clus.deg.df.vc$FDR < 0.05 & clus.deg.df.vc$change == "signif"] <- "High in AD"
+clus.deg.df.vc$effect[clus.deg.df.vc$logFC < -1.5 & clus.deg.df.vc$CI.R < -1 & 
+                     clus.deg.df.vc$FDR  < 0.05 & clus.deg.df.vc$change == "signif"] <- "High in TG"
+clus.deg.df.vc$delabel <- NA
+clus.deg.df.vc$delabel[clus.deg.df.vc$effect != "NS"] <- clus.deg.df.vc$Gene[clus.deg.df.vc$effect != "NS"]
+#df <- drop_na(df)
+clus.deg.df.vc.plt <- clus.deg.df.vc %>%  
+  ggplot(aes(x=logFC, y=-log10(FDR), color=effect,label=delabel)) + 
+  geom_point() +  scale_color_manual(values = c("#39568CFF","#440154FF","lightgrey")) + 
+  theme_classic(base_size = 15) + labs(col='') + geom_label_repel() +
+  #facet_wrap(~effect,scales = 'free') +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") +
+  xlab('Fold-change (log2)') + ylab('FDR (-log10)') + 
+  ggtitle("Profile of the 843 DEGs")
+
+# Heatmap
+cc <- clus.deg.df.vc %>% drop_na()
+clus.deg.df.z <- df.z %>% rownames_to_column("Gene") %>%
+  dplyr::filter(Gene %in% cc[["Gene"]]) %>%
+  column_to_rownames("Gene")
+set.seed(223)
+deg.z.hm <- ComplexHeatmap::pheatmap(clus.deg.df.z, show_rownames = F,
+          annotation_col = meta1, cluster_cols = T,color = viridis(200),
+          row_dend_side = c("right"),show_colnames = F,
+         cluster_rows = T, name = "z-score", main = "Heatmap of the 843 DEGs")
+```
+
+```{r PCA}
+# PCA
+p <- pca(clus.deg.df.z, metadata = meta1, removeVar = 0.1, transposed = F)
+p[["metadata"]] <- as.data.frame(p[["metadata"]])
+#scree plot
+screeplot(p, axisLabSize = 18, titleLabSize = 22)
+# which variable drives the PC the most
+eigencorplot(p, components = getComponents(p, 1:2),
+              metavars = c('disease','Class','sex','age')) + scale_color_viridis()
+clus.deg.pca.plot <- biplot(p, colby = 'disease',colLegendTitle = 'Sample',
+              legendPosition = "right",legendLabSize = 12,  legendTitleSize = 14,
+              legendIconSize = 4,lab = NULL, pointSize = 2) +
+  theme_classic(base_size = 18) + theme(panel.border = element_rect(size = 1, fill = NA)) +
+  scale_color_viridis_d() + ggtitle("PCA based on the 843 DEGs")
+```
+
+```{r GSEA}
+## GSEA
+# get gene ENTREZID
+df <- bitr(clus.deg.df.vc$Gene, fromType = "SYMBOL",toType = c("ENTREZID"), OrgDb = org.Hs.eg.db) %>% 
+  drop_na() %>% dplyr::rename(Gene = SYMBOL)
+clus.deg.df.vc <- dplyr::left_join(df,clus.deg.df.vc)
+# GO
+go <- clus.deg.df.vc %>% dplyr::filter(effect != "NS")
+go <- go[order(-go[["logFC"]]),]
+original_gene_list <- go[["logFC"]]
+names(original_gene_list) <- go[["ENTREZID"]]
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+clus.deg.eGO <- gseGO(gene_list,exponent = 1,minGSSize = 20,maxGSSize =  length(gene_list),
+              eps = 1e-10, pvalueCutoff = 0.05,pAdjustMethod = "BH", ont ="ALL",
+              verbose = TRUE,seed = FALSE,  by = "fgsea",OrgDb = org.Hs.eg.db)
+# # GSEA
+# clus.deg.gsea <- GSEA(geneList=gene_list,exponent = 1,minGSSize = 20,maxGSSize = length(gene_list),
+#              eps = 1e-10, pvalueCutoff = 0.05,pAdjustMethod = "BH",verbose = TRUE,
+#              TERM2GENE = gmt,seed = FALSE,  by = "fgsea")
+
+# plot
+clus.deg.eGO.data <- clus.deg.eGO@result[order(clus.deg.eGO@result$NES,decreasing = F),]
+clus.deg.eGO.data[clus.deg.eGO.data == "plasma membrane bounded cell projection"] <- "membrane-bounded projection"
+clus.deg.eGO.data[clus.deg.eGO.data == "plasma membrane bounded cell projection organization"] <- "bounded-cell projection"
+clus.deg.eGO.data$effect[clus.deg.eGO.data$NES > 1] <- "AD"
+clus.deg.eGO.data$effect[clus.deg.eGO.data$NES < -1] <- "TG"
+clus.deg.GO.plt <- dplyr::filter(clus.deg.eGO.data, setSize > 100 & (NES > 2 | NES < -2)) %>% 
+  ggplot(aes(x=reorder(Description,setSize),y=setSize)) +
+  geom_bar(stat = "identity",position = "stack",alpha=0.00011) +
+  geom_segment(aes(x=Description, xend=Description, y=0, yend=setSize),size=1.5,color="#440154FF") +
+  geom_point(size=5, alpha=0.5,color="#440154FF") + coord_flip() + #scale_color_viridis() +
+  theme_classic(base_size = 15) + #scale_fill_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") +
+  ylab("Number of genes") + xlab('') + labs(fill='') + #facet_wrap(~effect, scales = "free") +
+  ggtitle("Gene ontologies associated with DEGs \n(NES > 2 or < -2, FDR < 0.001)")
+
+```
+
+```{r heatmap for synapse & neuronal development}
+library(stringr)
+# Synapse
+df <- clus.deg.eGO.data %>% dplyr::filter(Description == "synapse") %>% 
+  dplyr::select(core_enrichment) 
+cc1 <- as.data.frame(strsplit(df$core_enrichment, "/"))
+colnames(cc1) = c("Gene")
+# nervous system development
+df <- clus.deg.eGO.data %>% dplyr::filter(Description == "nervous system development") %>% 
+  dplyr::select(core_enrichment) 
+cc2 <- as.data.frame(strsplit(df$core_enrichment, "/"))
+colnames(cc2) = c("Gene")
+cc <- rbind(cc1,cc2)
+cc <- cc[!duplicated(cc$Gene),] # remove duplicates
+
+# get symbols
+neur.genes <- go %>% dplyr::filter(ENTREZID %in% cc)
+# plot heatmap
+neur.hm.data <- df.z %>% rownames_to_column("Gene") %>% 
+  dplyr::filter(Gene %in% neur.genes[["Gene"]]) %>% 
+  column_to_rownames("Gene")
+set.seed(290)
+neur.hm <- ComplexHeatmap::pheatmap(neur.hm.data, show_rownames = F, show_colnames = F,row_dend_side = c("right"),
+          annotation_col = meta1, cluster_cols = T,color = viridis(200), row_names_side = c("left"),
+         cluster_rows = T, name = "z-score", main = "Neurogenesis and synapse-related genes")
+
+```
+
+## Survival analyses
+```{r define signif, PART I}
+clus.df$change <- "signif"
+df.vc <- deg %>% dplyr::left_join(clus.df)
+```
+
+```{r survival analyses functions}
+# define workpath
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/mutation/"
+# prep degs
+y <- dplyr::filter(df.vc, change == "signif")
+genelist <- dplyr::select(y,c(1)) %>% dplyr::rename(Hugo_Symbol = Gene)
+genelist$Hugo_Symbol <- as.factor(genelist$Hugo_Symbol)
+
+# Prep clinical TCGA data
+tcga.clin.data.prep <- function(id){
+    tcga.clin <- read.delim(paste0(workPath,id,"_clinical_patient.txt"),
+                            header = T, skip = 4)
+    tcga.clin <- tcga.clin %>% dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS",
+                                             "HISTOLOGICAL_DIAGNOSIS","SEX","RACE") %>%
+      dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+    tcga.clin[tcga.clin == "[Not Available]"] <- NA
+    tcga.clin$OS_MONTHS <- as.numeric(as.character(tcga.clin$OS_MONTHS))
+    tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",tcga.clin$OS_STATUS)
+    tcga.clin <- drop_na(tcga.clin)
+    return(tcga.clin)}
+
+# For skin cancer data
+skcm.tcga.clin.data.prep <- function(id){
+    tcga.clin <- read.delim(paste0(workPath,id,"_clinical_patient.txt"), 
+                            header = T, skip = 4) 
+    tcga.clin <- tcga.clin %>% 
+      dplyr::select("PATIENT_ID","AGE","OS_MONTHS","OS_STATUS","SEX","RACE") %>%
+      dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+    tcga.clin[tcga.clin == "[Not Available]"] <- NA
+    tcga.clin$OS_MONTHS <- as.numeric(as.character(tcga.clin$OS_MONTHS))
+    tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",tcga.clin$OS_STATUS)
+    tcga.clin <- drop_na(tcga.clin)
+    return(tcga.clin)}
+
+# TCGA gene expression, protein, epigenome
+tcga.expr.prep <- function(id){
+  expr.data <- read.delim(paste0(workPath,id,"_mrna_seq_v2_rsem_zscores_ref_all_samples.txt")) %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% dplyr::rename(Gene = Hugo_Symbol) %>% drop_na() %>% 
+    dplyr::filter(Gene %in% genelist$Hugo_Symbol)
+  library(reshape2)
+  expr.data <- reshape2::melt(expr.data, id="Gene")
+  colnames(expr.data) <- c("Gene", "PATIENT_ID", "Zscore")
+  expr.data$PATIENT_ID <- sub("\\.[^.]*$", "",expr.data$PATIENT_ID)
+  expr.data$Expression[expr.data$Zscore > 1.5] = "Increased" 
+  expr.data$Expression[expr.data$Zscore < -1.5] = "Decreased"
+  expr.data <- expr.data  %>% dplyr::select(-c("Zscore")) %>% drop_na()
+  return(expr.data)}
+
+# function to survival
+fxn.expr <- function(data){
+  tryCatch({
+    k <- get(paste(data))
+    cancer <- gsub("\\..*","",data)
+    expr.data <- k[["expr.data"]]
+    clin.data <- k[["clin.data"]] 
+    k <- list()
+  for (gene in unique(expr.data$Gene)){
+    OS.data <- filter(expr.data, Gene == gene) %>% dplyr::select(-c(1)) 
+    colnames(OS.data) <- c('Tumor_Sample_Barcode', 'Expression')
+    OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+    OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+  if (length(unique(OS.data$Expression)) < 2) {dd <- data.frame(term = rep(c("ExpressionDecreased")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),D_median=c(NA), I_median=c(NA))} else{
+    OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased","Decreased"))
+    dd <- OS.data %>% group_by(Expression) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Expression,values_from = x)
+    if (dd$Decreased < 15 | dd$Increased < 15){dd <- data.frame(term = rep(c("ExpressionDecreased")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),D_median=c(NA), I_median=c(NA))} else {
+    surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Expression, data=OS.data)
+    ww <- surv_median(fit)
+    ww[is.na(ww)] <- max(OS.data$OS_MONTHS)
+    if (length(unique(OS.data$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    a <- coxph(formula = surv ~ (Expression + AGE), OS.data)} else {
+    a <- coxph(formula = surv ~ (Expression + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data)}
+    dd <- tidy(a, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "ExpressionDecreased") %>%
+      dplyr::select(-c(std.error,statistic)) %>% dplyr::mutate(D_median = ww[2,2]) %>% dplyr::mutate(I_median = ww[1,2])}
+    name <- paste0(gene,sep="_",cancer)
+    k[[name]] <- dd
+    colnames(k[[name]]) <- c("contrast","HR","pval",'CI_lower','CI_upper','D_median','I_median')
+    k[[name]]$Gene = gene
+    k[[name]]$tumor = cancer}}
+  k <- do.call(rbind,k) %>% tibble::remove_rownames()}, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  return(k)}
+```
+
+```{r surv analyses data prep, message=FALSE,warning=FALSE}
+setwd(workPath)
+# # Prep clinical TCGA data
+# brainLGG.data <- list()
+# brainLGG.data[["clin.data"]] <- tcga.clin.data.prep("lgg_tcga")
+# brainGBM.data <- list()
+# brainGBM.data[["clin.data"]]  <- tcga.clin.data.prep("gbm_tcga")
+# bladder.data <- list()
+# bladder.data[["clin.data"]] <- tcga.clin.data.prep("blca_tcga")
+# breast.data <- list()
+# breast.data[["clin.data"]] <- tcga.clin.data.prep("brca_tcga")
+# cervical.data <- list()
+# cervical.data[["clin.data"]] <- tcga.clin.data.prep("cesc_tcga")
+# colorectal.data <- list()
+# colorectal.data[["clin.data"]] <- tcga.clin.data.prep("coadread_tcga")
+# kidney.data <- list()
+# kidney.data[["clin.data"]] <- tcga.clin.data.prep("kirc_tcga")
+# liver.data <- list()
+# liver.data[["clin.data"]] <- tcga.clin.data.prep("lihc_tcga")
+# lung.data <- list()
+# lung.data[["clin.data"]] <- tcga.clin.data.prep("luad_tcga")
+# ovarian.data <- list()
+# ovarian.data[["clin.data"]] <- tcga.clin.data.prep("ov_tcga")
+# pancreatic.data <- list()
+# pancreatic.data[["clin.data"]] <- tcga.clin.data.prep("paad_tcga")
+# prostate.data <- list()
+# prostate.data[["clin.data"]] <- tcga.clin.data.prep("prad_tcga")
+# thyroid.data <- list()
+# thyroid.data[["clin.data"]] <- tcga.clin.data.prep("thca_tcga")
+# skin.data <- list()
+# skin.data[["clin.data"]] <- skcm.tcga.clin.data.prep("skcm_tcga")
+# endometrial.data <- list()
+# endometrial.data[["clin.data"]] <- tcga.clin.data.prep("ucec_tcga")
+# sarcoma.data <- list()
+# sarcoma.data[["clin.data"]] <- tcga.clin.data.prep("sarc_tcga")
+# stomach.data <- list()
+# stomach.data[["clin.data"]] <- tcga.clin.data.prep("stad_tcga")
+# headneck.data <- list()
+# headneck.data[["clin.data"]] <- tcga.clin.data.prep("hnsc_tcga")
+# # Prep gene expression TCGA data
+# brainLGG.data[["expr.data"]] <- tcga.expr.prep("lgg_tcga")
+# brainGBM.data[["expr.data"]]  <- tcga.expr.prep("gbm_tcga")
+# bladder.data[["expr.data"]] <- tcga.expr.prep("blca_tcga")
+# breast.data[["expr.data"]] <- tcga.expr.prep("brca_tcga")
+# cervical.data[["expr.data"]] <- tcga.expr.prep("cesc_tcga")
+# colorectal.data[["expr.data"]] <- tcga.expr.prep("coadread_tcga")
+# kidney.data[["expr.data"]] <- tcga.expr.prep("kirc_tcga")
+# liver.data[["expr.data"]] <- tcga.expr.prep("lihc_tcga")
+# lung.data[["expr.data"]] <- tcga.expr.prep("luad_tcga")
+# ovarian.data[["expr.data"]] <- tcga.expr.prep("ov_tcga")
+# pancreatic.data[["expr.data"]] <- tcga.expr.prep("paad_tcga")
+# prostate.data[["expr.data"]] <- tcga.expr.prep("prad_tcga")
+# thyroid.data[["expr.data"]] <- tcga.expr.prep("thca_tcga")
+# skin.data[["expr.data"]] <- tcga.expr.prep("skcm_tcga")
+# endometrial.data[["expr.data"]] <- tcga.expr.prep("ucec_tcga")
+# sarcoma.data[["expr.data"]] <- tcga.expr.prep("sarc_tcga")
+# stomach.data[["expr.data"]] <- tcga.expr.prep("stad_tcga")
+# headneck.data[["expr.data"]] <- tcga.expr.prep("hnsc_tcga")
+# #
+# #Perform cox modeling for each tumor subtype
+# # # breast
+# breast.data[["surv.expr"]] <- fxn.expr("breast.data")
+# # glioma
+# brainLGG.data[["surv.expr"]] <- fxn.expr("brainLGG.data")
+# brainGBM.data[["surv.expr"]] <- fxn.expr("brainGBM.data")
+# # bladder
+# bladder.data[["surv.expr"]] <- fxn.expr("bladder.data")
+# # cervical
+# cervical.data[["surv.expr"]] <- fxn.expr("cervical.data")
+# # colorectal
+# colorectal.data[["surv.expr"]] <- fxn.expr("colorectal.data")
+# # endometrial
+# endometrial.data[["surv.expr"]]  <- fxn.expr("endometrial.data")
+# # headneck
+# headneck.data[["surv.expr"]]  <- fxn.expr("headneck.data")
+# # kidney
+# kidney.data[["surv.expr"]] <- fxn.expr("kidney.data")
+# # liver
+# liver.data[["surv.expr"]] <- fxn.expr("liver.data")
+# # lung
+# lung.data[["surv.expr"]] <- fxn.expr("lung.data")
+# # ovarian
+# ovarian.data[["surv.expr"]]  <- fxn.expr("ovarian.data")
+# # pancreatic
+# pancreatic.data[["surv.expr"]]  <- fxn.expr("pancreatic.data")
+# # prostate
+# prostate.data[["surv.expr"]] <- fxn.expr("prostate.data")
+# # pancreatic
+# pancreatic.data[["surv.expr"]] <- fxn.expr("pancreatic.data")
+# # sarcoma
+# sarcoma.data[["surv.expr"]] <- fxn.expr("sarcoma.data")
+# # stomach
+# stomach.data[["surv.expr"]] <- fxn.expr("stomach.data")
+# # thyroid
+# thyroid.data[["surv.expr"]] <- fxn.expr("thyroid.data")
+# # skin
+# skin.data[["clin.data"]]$HISTOLOGICAL_DIAGNOSIS <- "Melanoma"
+# skin.data[["surv.expr"]]  <- fxn.expr("skin.data")
+
+```
+
+```{r tidy cox data}
+# Prep cox for expr cox stats
+cox.data.expr <- rbind(breast.data[["surv.expr"]],brainLGG.data[["surv.expr"]],
+              brainGBM.data[["surv.expr"]],bladder.data[["surv.expr"]],endometrial.data[["surv.expr"]],
+              headneck.data[["surv.expr"]],kidney.data[["surv.expr"]],liver.data[["surv.expr"]],
+              lung.data[["surv.expr"]],
+              ovarian.data[["surv.expr"]],sarcoma.data[["surv.expr"]],skin.data[["surv.expr"]],
+              stomach.data[["surv.expr"]],cervical.data[["surv.expr"]])
+cox.data.expr[cox.data.expr == "Inf"] <- NA
+cox.data.expr <- cox.data.expr %>% dplyr::mutate(adj.pval = p.adjust(cox.data.expr$pval,method="BH")) %>% 
+  drop_na() %>% dplyr::filter(HR < 10) %>% dplyr::filter(HR > 1e-5) %>% 
+  dplyr::mutate(median_diff = abs(D_median-I_median)) %>% 
+  dplyr::mutate(median_ratio = D_median/I_median)
+cox.data.expr$id <- paste(cox.data.expr$Gene,cox.data.expr$tumor,sep= ".")
+cox.data.expr[cox.data.expr == "ExpressionDecreased"] <- 'Decreased/Increased'
+
+# # cox.data.expr <- cox.data.expr %>% filter(median_diff > 5)
+# # Test for proportionality assumption for cox model
+# # cox.zph(cox_reg_model)
+```
+
+```{r cox gene analyses, warning=FALSE,message=FALSE, fig.width=16, fig.height=5}
+# define significance
+df <- cox.data.expr 
+df$effect <- "Not significant"
+# define significant associations
+df$effect[df$HR > 1.2 & df$CI_lower > 1 & (df$D_median < df$I_median) & #(df$D_median < 24 | df$I_median < 24) &
+            (df$median_ratio > 2 | df$median_ratio < 0.5) & df$median_diff > 12] <- "High expression = survival advantage"
+df$effect[df$HR < 0.8 & df$CI_upper < 1 & (df$D_median > df$I_median) &  #(df$D_median < 24 | df$I_median < 24) &
+            (df$median_ratio > 2 | df$median_ratio < 0.5) & df$median_diff > 12] <- "Low expression = survival advantage"
+surv.data <- df %>% filter(effect != "Not significant")
+df$label <- "High expression as reference"
+# prognostic genes data
+prognostic.genes <- dplyr::filter(df, effect != "Not significant") 
+# how many progn. genes??
+length(unique(prognostic.genes$Gene))
+# [1] 191
+```
+
+```{r prognostic neuro genes}
+neuro.prognostic.gene <- prognostic.genes %>% dplyr::filter(Gene %in% neur.genes$Gene)
+#length(unique(neuro.prognostic.gene$Gene))
+# [1] 88
+# which tumors have the most
+df1 <- neuro.prognostic.gene %>% group_by(tumor,effect) %>% summarise(x = length(unique(Gene)))
+assoc.cts.tumor <- ggplot(df1, aes(x=reorder(tumor,x),y=x,fill=effect)) + 
+  geom_bar(stat = "identity",position = "stack") +
+  theme_classic(base_size = 15) +  scale_fill_manual(values = c("#39568CFF","#440154FF")) + 
+  coord_flip() +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") + 
+  ylab("Number of gene") + xlab('Tumor') + labs(fill='') +
+  ggtitle("Number of prognostic neuro-synapse genes in each tumor")
+
+# which genes appear in most tumors
+df1 <- neuro.prognostic.gene %>% group_by(Gene,effect) %>% summarise(x = length(unique(tumor)))
+assoc.cts.gene <- dplyr::filter(df1,x > 1) %>% ggplot(aes(x=reorder(Gene,x),y=x)) + 
+  geom_bar(stat = "identity",position = "stack",alpha=0.0000001) + 
+  #scale_color_manual(values = c("#39568CFF","#440154FF")) +
+  geom_segment(aes(x=Gene, xend=Gene, y=0, yend=x),size=1,color="#23888EFF") +
+  geom_point(size=3, alpha=0.5,color ="#23888EFF") + coord_flip() +
+  theme_classic(base_size = 15) + #scale_fill_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") + 
+  ylab("Number of cancer types") + xlab('') + labs(fill='') + facet_wrap(~effect, scales = "free") +
+  ggtitle("Prognostic neuro-synapse genes") + scale_y_continuous(limits = c(0, max(df1$x)), breaks = seq(0, max(df1$x), by = 1))
+
+```
+
+```{r survival plots for GOIs}
+library(gridExtra)
+cc <- df1 %>% dplyr::filter(x == 3)
+ls <- neuro.prognostic.gene %>% dplyr::filter(Gene %in% cc$Gene)
+for (ids in ls$id){
+data <- paste0((gsub("^[^.]*\\.","",ids)),".data")
+gene <- gsub("\\..*","",ids)
+k <- get(paste(data))
+cancer <- gsub("\\..*","",data)
+    expr.data <- k[["expr.data"]]
+    clin.data <- k[["clin.data"]] 
+    k <- list()
+    OS.data <- filter(expr.data, Gene == gene) %>% dplyr::select(-c(1)) 
+    colnames(OS.data) <- c('Tumor_Sample_Barcode', 'Expression')
+    OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+    OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+    OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased","Decreased"))
+    dd <- OS.data %>% group_by(Expression) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Expression,values_from = x)
+    surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Expression, data=OS.data)
+    ww <- surv_median(fit)
+    ww[is.na(ww)] <- max(OS.data$OS_MONTHS)
+    if (length(unique(OS.data$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    a <- coxph(formula = surv ~ (Expression + AGE), OS.data)} else {
+    a <- coxph(formula = surv ~ (Expression + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data)}
+    dd <- tidy(a, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "ExpressionDecreased") %>%
+      dplyr::select(-c(std.error,statistic))
+    dd[dd == "ExpressionDecreased"] <- "High/Low"
+    name <- paste0(gene,sep="_",cancer)
+    colnames(dd) <- c("contrast","HR","pval",'CI_lower','CI_upper','L_median','H_median')
+    p <- ggsurvplot(fit = fit, pval = F, risk.table = F, fun = "pct", conf.int =F, break.x.by = 40,
+                xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+                risk.table.title="", ggtheme =  theme_classic(base_size = 15),
+                palette = c("#39568CFF","#440154FF"), legend = "top",
+                legend.labs = c("High mRNA", "Low mRNA"))
+p$plot <- p$plot + theme(panel.border = element_rect(size = 1, fill = NA)) + labs(color='') +
+    annotation_custom(tableGrob(dd,rows=NULL, theme=ttheme_minimal(base_size = 10)),
+                      (max(OS.data$OS_MONTHS)/2), xmax=(max(OS.data$OS_MONTHS)/2), ymin=3, ymax=5)
+p <- p + ggtitle(name)
+print(p)}
+
+```
+
+
+
+
+
+```{r goi heatmap}
+# plot heatmap
+goi.hm.data <- df.z %>% rownames_to_column("Gene") %>% 
+  dplyr::filter(Gene %in% prognostic.genes[["Gene"]]) %>% 
+  column_to_rownames("Gene")
+set.seed(419)
+goi.hm <- ComplexHeatmap::pheatmap(goi.hm.data, show_rownames = F, show_colnames = F,row_dend_side = c("right"),
+          annotation_col = meta1, cluster_cols = T,color = viridis(200),
+         cluster_rows = T, name = "z-score", main = "Heatmap of the 137 GOIs")
+```
+
+```{r volcano plot}
+# get deg info for progn genes
+goi <- data.frame(Gene = c(unique(prognostic.genes$Gene)),change = c("signif"))
+df.vc <- deg %>% dplyr::left_join(goi)
+# prep fo volcano
+df.vc$effect <- 'NS'
+df.vc$effect[df.vc$logFC > 1.5 & df.vc$CI.L > 1 & df.vc$FDR < 0.05 & df.vc$change == "signif"] <- "High in TG"
+df.vc$effect[df.vc$logFC < -1.5 & df.vc$CI.R < -1 & df.vc$FDR  < 0.05 & df.vc$change == "signif"] <- "High in ND"
+df.vc$delabel <- NA
+df.vc$delabel[df.vc$effect != "NS"] <- df.vc$Gene[df.vc$effect != "NS"]
+#df <- drop_na(df)
+vc.plt <- df.vc %>% #dplyr::filter(effect !="NS") %>% 
+  ggplot(aes(x=logFC, y=-log10(FDR), color=effect,label=delabel)) + 
+  geom_point() +  scale_color_manual(values = c("#39568CFF","#440154FF","lightgrey")) + 
+  theme_classic(base_size = 15) + labs(col='') + geom_label_repel() +
+  #facet_wrap(~effect,scales = 'free') +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") +
+  xlab('Fold-change (log2)') + ylab('FDR (-log10)') + 
+  ggtitle("Profile of the 137 GOIs")
+```
+
+```{r PCA}
+p <- pca(df.z, metadata = meta1, removeVar = 0.1, transposed = F)
+p[["metadata"]] <- as.data.frame(p[["metadata"]])
+#scree plot
+screeplot(p, axisLabSize = 18, titleLabSize = 22)
+# which variable drives the PC the most
+eigencorplot(p, components = getComponents(p, 1:2),
+              metavars = c('disease','Class','sex','age')) + scale_color_viridis()
+pca.plot <- biplot(p, colby = 'disease',colLegendTitle = 'Sample', 
+              legendPosition = "right",legendLabSize = 12,  legendTitleSize = 14, 
+              legendIconSize = 4,lab = NULL, pointSize = 2) + 
+  theme_classic(base_size = 18) + theme(panel.border = element_rect(size = 1, fill = NA)) + 
+  scale_color_viridis_d() + ggtitle("PCA based on the 137 GOI")
+```
+
+```{r goi DO}
+# get gene ENTREZID
+df <- bitr(df.vc$Gene, fromType = "SYMBOL",toType = c("ENTREZID"), OrgDb = org.Hs.eg.db) %>% 
+  drop_na() %>% dplyr::rename(Gene = SYMBOL)
+df.vc <- dplyr::left_join(df,df.vc)
+# perform degs
+go <- df.vc %>% dplyr::filter(effect != "NS")
+go <- go[order(-go[["logFC"]]),]
+original_gene_list <- go[["logFC"]]
+names(original_gene_list) <- go[["ENTREZID"]]
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+# disease ontology
+edo <- gseDO(gene_list,exponent = 1,minGSSize = 20,maxGSSize = 25000,
+             eps = 1e-10, pvalueCutoff = 0.01,pAdjustMethod = "BH",
+             verbose = TRUE,seed = FALSE,  by = "fgsea")
+# dotplot
+# edo.plt <- dotplot(edo, showCategory=10,label_format=20,color="qvalue",split=".sign") + 
+#   ggtitle("disease ontology for DEGs between TG and ND") + 
+#   scale_color_viridis_c() + facet_grid(.~.sign)
+## ggplot
+df <- edo@result[order(edo@result$NES,decreasing = T),]
+df <- rbind((head(df,n=10)), (tail(df,n=3)))
+df$effect[df$NES > 1] <- "Associated with genes high in TG"
+df$effect[df$NES < 1] <- "Associated with genes high in ND"
+df[df == "malignant ovarian surface epithelial-stromal neoplasm"] <- "epithelial-stromal neoplasm"
+df[df == "developmental disorder of mental health"] <- "disorder of mental health"
+do.plt <- ggplot(df,aes(x=reorder(Description,NES),y=NES,fill=effect,color=effect)) + 
+  geom_bar(stat = "identity",position = "stack",alpha=0.2) + 
+  scale_color_manual(values = c("#39568CFF","#440154FF")) +
+  geom_segment(aes(x=Description, xend=Description, y=0, yend=NES),size=1.5) +
+  geom_point(size=5, alpha=0.5) + coord_flip() +
+  theme_classic(base_size = 15) + scale_fill_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") + 
+  ylab("NES") + xlab('') + labs(fill='') + #facet_wrap(~effect, scales = "free") +
+  ggtitle("Top disease ontology \nassociated with DEGs")
+
+```
+
+```{r goi GO}
+# perform GO: Up in TG
+go <- df.vc %>% dplyr::filter(effect != "NS")
+go <- go[order(-go[["logFC"]]),]
+original_gene_list <- go[["logFC"]]
+names(original_gene_list) <- go[["ENTREZID"]]
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+eGO <- gseGO(gene_list,exponent = 1,minGSSize = 20,maxGSSize = 25000,
+              eps = 1e-10, pvalueCutoff = 0.01,pAdjustMethod = "BH", ont ="ALL",
+              verbose = TRUE,seed = FALSE,  by = "fgsea",OrgDb = org.Hs.eg.db)
+# plot
+eGO.data <- eGO@result[order(eGO@result$NES,decreasing = F),]
+eGO.data[eGO.data == "extracellular membrane-bounded organelle"] <- "membrane-bounded organelle"
+eGO.data[eGO.data == "plasma membrane bounded cell projection"] <- "bounded-cell projection"
+eGO.data$effect[eGO.data$NES > 1] <- "TG"
+eGO.data$effect[eGO.data$NES < 1] <- "AD"
+GO.plt <- ggplot(eGO.data,aes(x=reorder(Description,NES),y=NES,fill=effect,color=effect)) + 
+  geom_bar(stat = "identity",position = "stack",alpha=0.2) + 
+  scale_color_manual(values = c("#39568CFF","#440154FF")) +
+  geom_segment(aes(x=Description, xend=Description, y=0, yend=NES),size=1.5) +
+  geom_point(size=5, alpha=0.5) + coord_flip() +
+  theme_classic(base_size = 15) + scale_fill_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") + 
+  ylab("Normalized Enrichment Score") + xlab('') + labs(fill='') + #facet_wrap(~effect, scales = "free") +
+  ggtitle("Gene ontologies associated \nwith GOI (q-value < 0.01)")
+
+```
+
+```{r synapse}
+library(stringr)
+df <- eGO.data %>% dplyr::filter(Description == "synapse") %>% 
+  dplyr::select(core_enrichment) 
+cc <- as.data.frame(strsplit(df$core_enrichment, "/"))
+colnames(cc) = c("Gene")
+
+# get symbols
+cc <- go %>% dplyr::filter(ENTREZID %in% cc$Gene)
+
+# plot heatmap
+syn.hm.data <- df.z %>% rownames_to_column("Gene") %>% 
+  dplyr::filter(Gene %in% cc[["Gene"]]) %>% 
+  column_to_rownames("Gene")
+set.seed(545)
+syn.hm <- ComplexHeatmap::pheatmap(syn.hm.data, show_rownames = T, show_colnames = F,row_dend_side = c("right"),
+          annotation_col = meta1, cluster_cols = T,color = viridis(200), row_names_side = c("left"),
+         cluster_rows = T, name = "z-score", main = "Heatmap of the synapse-related GOIs",fontsize_row = 5)
+```
+
+
+``` {r progn gene x'terization}
+# which tumors have the most prognostic genes
+df1 <- prognostic.genes %>% group_by(tumor,effect) %>% summarise(x = length(unique(Gene)))
+assoc.cts.tumor <- ggplot(df1, aes(x=reorder(tumor,x),y=x,fill=effect)) + 
+  geom_bar(stat = "identity",position = "stack") +
+  theme_classic(base_size = 15) +  scale_fill_manual(values = c("#39568CFF","#440154FF")) + 
+  coord_flip() +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") + 
+  ylab("Number of gene") + xlab('Tumor') + labs(fill='') +
+  ggtitle("Number of genes with strong \nprognostic implication in each tumor")
+
+```
+
+```{r PART 3}
+# which genes occur in most tumors
+df1 <- prognostic.genes %>% group_by(Gene,effect) %>% summarise(x = length(unique(tumor)))
+assoc.cts.gene <- dplyr::filter(df1, x > 2) %>% ggplot(aes(x=reorder(Gene,x),y=x,fill=effect,color=effect)) + 
+  geom_bar(stat = "identity",position = "stack",alpha=0.2) + 
+  scale_color_manual(values = c("#39568CFF","#440154FF")) +
+  geom_segment(aes(x=Gene, xend=Gene, y=0, yend=x),size=1.5) +
+  geom_point(size=5, alpha=0.5) + coord_flip() +
+  theme_classic(base_size = 15) + scale_fill_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "none") + 
+  ylab("Number of cancer types") + xlab('') + labs(fill='') + facet_wrap(~effect, scales = "free") +
+  ggtitle("GOIs with prognostic associations in > 3 tumor types")
+
+# # PLOT IDEA 2
+# df <- dplyr::left_join(df1,prognostic.genes) 
+# df$delabel[df$x > 2] <- df$Gene[df$x > 2]
+# dplyr::filter(df,x>2) %>% ggplot(aes(HR, tumor,color=tumor)) + geom_point(aes(size=-log(adj.pval))) +
+#   facet_wrap(~effect, scales = 'free') + 
+#   scale_color_aaas(alpha = 0.9) + geom_label_repel(aes(label=delabel)) + coord_flip() +
+#     theme_classic(base_size = 15) + theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right")
+#   #scale_color_manual(values = c("#39568CFF","#440154FF"))
+
+```
+
+
+```{r survival plots for synapse}
+library(gridExtra)
+ls <- prognostic.genes %>% dplyr::filter(Gene %in% cc$Gene)
+ls <- head(ls,n=1)
+
+for (ids in ls$id){
+data <- paste0((gsub("^[^.]*\\.","",ids)),".data")
+gene <- gsub("\\..*","",ids)
+k <- get(paste(data))
+cancer <- gsub("\\..*","",data)
+    expr.data <- k[["expr.data"]]
+    clin.data <- k[["clin.data"]] 
+    k <- list()
+    OS.data <- filter(expr.data, Gene == gene) %>% dplyr::select(-c(1)) 
+    colnames(OS.data) <- c('Tumor_Sample_Barcode', 'Expression')
+    OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+    OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+    OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased","Decreased"))
+    dd <- OS.data %>% group_by(Expression) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Expression,values_from = x)
+    surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Expression, data=OS.data)
+    ww <- surv_median(fit)
+    ww[is.na(ww)] <- max(OS.data$OS_MONTHS)
+    if (length(unique(OS.data$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    a <- coxph(formula = surv ~ (Expression + AGE), OS.data)} else {
+    a <- coxph(formula = surv ~ (Expression + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data)}
+    dd <- tidy(a, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "ExpressionDecreased") %>%
+      dplyr::select(-c(std.error,statistic))
+    dd[dd == "ExpressionDecreased"] <- "High/Low"
+    name <- paste0(gene,sep="_",cancer)
+    colnames(dd) <- c("contrast","HR","pval",'CI_lower','CI_upper','L_median','H_median')
+    p <- ggsurvplot(fit = fit, pval = F, risk.table = F, fun = "pct", conf.int =F, break.x.by = 40,
+                xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+                risk.table.title="", ggtheme =  theme_classic(base_size = 15),
+                palette = c("#39568CFF","#440154FF"), legend = "top",
+                legend.labs = c("High mRNA", "Low mRNA"))
+p$plot <- p$plot + theme(panel.border = element_rect(size = 1, fill = NA)) + labs(color='') +
+    annotation_custom(tableGrob(dd,rows=NULL, theme=ttheme_minimal(base_size = 10)),
+                      (max(OS.data$OS_MONTHS)/2), xmax=(max(OS.data$OS_MONTHS)/2), ymin=3, ymax=5)
+p <- p + ggtitle(name)
+print(p)}
+
+```
+
+
+```{r save image}
+# save image
+save.image("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/transcriptomics/Array.analysis.data.RData")
+```
+
+
+
+```{r misc}
+.data <- list(transformed.counts=cts, raw.counts = rawCTS, PCA = pca.plot,
+                     dis.counts = dis.cts, ctrl.counts = ctrl.cts, dis.counts.z = dis.cts.zscore, 
+                     GSEA=GSEAresults,  
+                     meta=coldata, 
+                     sig.degs=go, 
+                     degs=deg, 
+                     geneInfo=gL)
+
+# remove trash
+rm(a,b,c,coldata,ctrl.cts,cts,d0,deg,design,df,dis.cts,dis.cts.zscore,ex,fit,gL,go,
+   GSEA,GSEAresults,gset,k,kk,kkk,p,pca.plot, pheno,rawCTS,results,id,anno,idx,id,plat)
+
+
+# Volcano
+# assoc.volcano.plt <- df %>% filter(effect != "Not significant") %>%  
+#   ggplot(aes(HR, -log10(adj.pval), size=median_diff, color=effect, label = id)) + geom_point() + 
+#   theme_classic(base_size = 15) + scale_color_manual(values = c("#39568CFF","#440154FF","lightgrey")) +  
+#   theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") + 
+#   xlab("Hazard Ratio (HR)") + ylab("Significance: -log10(BH-corrected pvalue)") + 
+#   labs(color='Association')  +  facet_wrap(~label,scales = "free") + #geom_label_repel() +
+#   ggtitle("Association of gene expresion \nwith cancer prognosis") + facet_wrap(~effect, scales = "free")
+```
+
+```{r gsea for tumor-specific prognostic genes}
+# df <-  dplyr::filter(prognostic.genes, tumor == "headneck")
+# gg <- unique(df$Gene)
+# # get logFC values for the prog genes and run GSEA
+# go <- df.vc %>% dplyr::filter(effect != "NS") 
+# go <- go[order(-go[["logFC"]]),]
+# original_gene_list <- go[["logFC"]]
+# names(original_gene_list) <- go[["ENTREZID"]]
+# gene_list<-na.omit(original_gene_list)
+# gene_list = sort(gene_list, decreasing = TRUE)
+# # Gene ontology
+# gsea.obj <- GSEA(geneList=gene_list,exponent = 1,minGSSize = 20,maxGSSize = 25000,
+#              eps = 1e-10, pvalueCutoff = 0.05,pAdjustMethod = "BH",verbose = TRUE,
+#              TERM2GENE = gmt,seed = FALSE,  by = "fgsea")
+# # plots
+# edox <- setReadable(gsea.obj, 'org.Hs.eg.db', 'ENTREZID')
+# edox2 <- pairwise_termsim(edox)
+# treeplot(edox2,showCategory=100, color = "qvalue",nWords=2,ncluster=2,label_format = 100)
+# emapplot(edox2,showCategory=100, color = "qvalue",nWords=2,ncluster=2,label_format = 100)
+# dotplot(gsea.obj,split=".sign",label_format=100,color="qvalue",showCategory=10) +
+#   facet_grid(.~.sign) + scale_color_viridis_c() +
+#   ggtitle("Enrichment associated with prognostic genes in LGG") 
+
+# eGO@result$effect[eGO@result$NES > 1] <- "Enriched in TG"
+# eGO@result$effect[eGO@result$NES < -1] <- "Enriched in ND"
+
+# plot
+# eGO.plt <- dotplot(eGO, showCategory=20,label_format=100,color="qvalue",split=".sign") + 
+#      ggtitle("enriched ontology for DEGs between TG and ND") + 
+#   scale_color_viridis_c() + facet_grid(.~.sign)
+# # Gene ontology
+# # gsea.obj <- GSEA(geneList=gene_list,exponent = 1,minGSSize = 20,maxGSSize = 25000,
+# #              eps = 1e-10, pvalueCutoff = 0.05,pAdjustMethod = "BH",verbose = TRUE,
+# #              TERM2GENE = gmt,seed = FALSE,  by = "fgsea")
+# # gsea.plt <- dotplot(gsea.obj,split=".sign",label_format=100,color="qvalue",showCategory=10) +
+# #   facet_grid(.~.sign) + scale_color_viridis_c() +
+# #   ggtitle("Enrichment associated with prognostic genes in LGG")
+
+```

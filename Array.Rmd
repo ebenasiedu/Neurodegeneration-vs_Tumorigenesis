@@ -1,0 +1,144 @@
+---
+title: "Transcriptomic Profiling"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(readr)
+library(purrr)
+library(tidyverse)
+library(GEOquery)
+library(PCAtools)
+library(limma)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+knitr::opts_chunk$set(echo = TRUE)
+
+# function to calculate z.score
+zscore <- function(x){
+  x1 <- x
+  x1 <- sapply(x1, function(x1) (x1-mean(x1))/sd(x1))
+  rownames(x1) = rownames(x)
+  x1 <- as.data.frame(x1)}
+
+# define working directory path
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/"
+
+# laod
+#load("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/transcriptomics/Array.data.RData")
+```
+
+# {.tabset}
+
+```{r prep_gmt, include=FALSE, message=FALSE,warning=FALSE}
+## Prep gene sets for GSEA 
+mypath <- paste0(workPath, "transcriptomics/gmt/")
+setwd(mypath)
+files <- list.files(mypath, pattern ="*.gmt")
+df <- map(files, .f=read.gmt)
+gmt <- do.call(rbind,df)
+gmt$term <- tolower(gmt$term)
+```
+
+## Data Prep
+```{r read_GEO_data}
+id <- 'GSE16560'
+#plat <- "GPL10558"
+gset <- getGEO(id)
+#id <- paste0(id, "-",plat,sep="")
+
+# log2 transformation & normalize data
+ex <- exprs(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]])
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+          (qx[6]-qx[1] > 50 && qx[2] > 0)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+  exprs(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]) <- log2(ex)}
+
+exprs(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]) <- normalizeBetweenArrays(exprs(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]])) 
+# Counts
+cts <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@assayData[["exprs"]]) 
+pheno <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@phenoData@data)
+```
+
+```{r prep_pheno}
+pheno <- pheno %>% dplyr::select(c(1,8,45,46)) %>% rownames_to_column("ID") %>% drop_na()
+
+#pheno <- pheno %>% separate(col=5,sep=":",into=(c(NA,"a"))) 
+
+#pheno <- pheno %>% relocate(age, .after = sex)
+
+#pheno[pheno == "frontal"] <- "Cortex"
+
+colnames(pheno) <- c("id","group",'tissue',"age","sex")
+pheno$geoid <- id
+pheno$disease <- "Prostate"
+pheno$Class <- "Tumor"
+```
+
+```{r filter_disease}
+dis_id <- "prostate"
+pheno <- pheno %>% 
+  mutate_at(vars(group), funs(replace(., grepl(dis_id, .), "dis"))) %>% 
+  filter(group ==  "dis")
+
+# match counts with pheno
+idx <- match(pheno$id, colnames(cts))
+cts  <- cts[,idx] %>% drop_na()
+```
+
+```{r sex&age refine}
+pheno$sex <- "Male"
+
+pheno$tissue <- "Prostate"
+
+pheno$age <- gsub("NA", "55", pheno$age)
+
+# pheno$tissue[pheno$tissue == "tissue: primary CRC from "] <- ""
+# pheno$sex <- gsub("gender: ", "", pheno$sex)
+```
+
+```{r prep gene_id}
+anno_id <- 'SYMBOL'
+# gene annotation
+gL <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@featureData@data) %>% 
+  rownames_to_column('id') %>% dplyr::select(c('id', anno_id)) %>% drop_na()
+
+#gL <- separate(gL, col=2,into=c(NA,"Gene"),sep=" // ") %>% drop_na()
+
+# get dis counts
+dis.cts  <-  rownames_to_column(cts,'id') 
+dis.cts <- left_join(gL, dis.cts) %>% dplyr::select(-c('id'))
+dis.cts <- dis.cts %>% separate(col = 1, into = c("Gene"), sep = " /// ")
+dis.cts <- dis.cts[!duplicated(dis.cts[["Gene"]]),] #%>% dplyr::rename("Gene" = anno_id)
+
+# zscore
+df <- dis.cts %>% remove_rownames() %>% column_to_rownames("Gene")
+cts.zscore <- zscore(df) %>% rownames_to_column("Gene")
+```
+
+```{r put data together}
+# phenodata
+METADATA <- rbind(METADATA,pheno)
+
+# norm counts
+#COUNTS.DATA <- merge(COUNTS.DATA, COUNTS.DATA.supp, by="Gene", all=T)
+#COUNTS.DATA.supp <- merge(COUNTS.DATA.supp, dis.cts, by="Gene", all=T)
+
+# Zscore cts
+#ZCOUNTS.DATA <- merge(ZCOUNTS.DATA, ZCOUNTS.DATA.supp, by="Gene", all=T)
+#ZCOUNTS.DATA.supp <- merge(ZCOUNTS.DATA.supp, cts.zscore, by="Gene", all=T)
+
+# Clear unwanted
+rm(cts,cts.zscore,df,dis.cts,ex,gL,pheno,anno_id,dis_id,id,idx,LogC,plat,qx,gset)
+```
+
+
+```{r save image}
+# save image
+#save.image("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/transcriptomics/Array.data.RData")
+```
+

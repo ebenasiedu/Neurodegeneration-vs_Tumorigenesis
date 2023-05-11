@@ -1,0 +1,834 @@
+---
+title: "Molecular relationship between tumorigenesis and neurodegeneration"
+author: "Eben"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  #powerpoint_presentation:
+  html_document:
+    #toc: yes
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(tidyverse)
+library(ggExtra)
+library(plyr)
+library(viridis)
+library(tibble)
+library(janitor)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(survival)
+library(survminer)
+library(readr)
+library(purrr)
+library(data.table)
+library(emmeans)
+library(gridExtra)
+library(ComplexHeatmap)
+library(ggrepel)
+library(broom)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+#set up palette
+library(scales)
+mypal = (viridis_pal()(16))
+show_col(viridis_pal()(16))
+
+# define directory to files. download repo and change this directory to where repo is saved 
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/mutation/"
+
+# Load and explore saved session. In case there is no time to run everything
+# Save & Load session
+load("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/manuscript/neuro_onco/Mutation.Rdata")
+
+```
+
+#  {.tabset}
+## Pre-process TCGA data {.tabset}
+### Define Functions
+```{r warning=FALSE,message=FALSE}
+# Prep TCGA alteration data
+tcga.prep <- function(id){
+  mut <- read.delim(paste0(workPath,id,"_mutations.txt")) %>% 
+    # select columns of interest
+    dplyr::select(c(Hugo_Symbol,Variant_Classification,Tumor_Sample_Barcode, 
+                    Chromosome,Start_Position,End_Position, Strand,
+                    Reference_Allele,Tumor_Seq_Allele2, Variant_Type))
+  mut <- merge(NDrisk,mut,by.y="Hugo_Symbol", all=F) # maintain data for only ND-related genes
+  # rename Tumor_Sample_Barcode
+  mut$Tumor_Sample_Barcode <- gsub("-", ".", mut$Tumor_Sample_Barcode)
+  # read and prep CNA data
+  cna <- read.delim(paste0(workPath,id,"_cna.txt"))
+  cna <- merge(NDrisk,cna,by.y="Hugo_Symbol", all=F) %>% dplyr::select(-c(2)) 
+  rownames(cna) <- cna$Hugo_Symbol
+  cna <- dplyr::select(cna, -c(1))
+  cna[cna == 0] <- "Unaltered"
+  cna[cna == -1] <- "Hemizygous deletion"
+  cna[cna == -2] <- "Deep deletion"
+  cna[cna == +1] <- "Copy number gain"
+  cna[cna == +2] <- "Copy number amplification"
+  cna <- cna %>% rownames_to_column("Hugo_Symbol")
+  # Tidy the data
+  cna <- pivot_longer(cna, cols = (2:ncol(cna)), values_to = "CN", 
+                      names_to = "Tumor_Sample_Barcode")
+return(list(mut.data = mut,cna.data = cna))}
+
+# Prep clinical TCGA data
+tcga.clin.data.prep <- function(id){
+    tcga.clin <- read.delim(paste0(workPath,id,"_clinical_patient.txt"),
+                            header = T, skip = 4)
+    tcga.clin <- tcga.clin %>% dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS",
+                                             "HISTOLOGICAL_DIAGNOSIS","SEX","RACE") %>%
+      dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+    tcga.clin[tcga.clin == "[Not Available]"] <- NA
+    tcga.clin$OS_MONTHS <- as.numeric(as.character(tcga.clin$OS_MONTHS))
+    tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",tcga.clin$OS_STATUS)
+    tcga.clin <- drop_na(tcga.clin)
+    return(tcga.clin)}
+
+# For skin cancer data
+skcm.tcga.clin.data.prep <- function(id){
+    tcga.clin <- read.delim(paste0(workPath,id,"_clinical_patient.txt"), 
+                            header = T, skip = 4) 
+    tcga.clin <- tcga.clin %>% dplyr::select("PATIENT_ID","AGE", "OS_MONTHS","OS_STATUS","SEX","RACE") %>%
+      dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+    tcga.clin[tcga.clin == "[Not Available]"] <- NA
+    tcga.clin$OS_MONTHS <- as.numeric(as.character(tcga.clin$OS_MONTHS))
+    tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",tcga.clin$OS_STATUS)
+    tcga.clin <- drop_na(tcga.clin)
+    return(tcga.clin)}
+
+# TCGA gene expression, protein, epigenome
+tcga.expr.prep <- function(id){
+  expr.data <- read.delim(paste0(workPath,id,"_mrna_seq_v2_rsem_zscores_ref_all_samples.txt")) %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% rename(Gene = Hugo_Symbol) %>% drop_na() %>% 
+    dplyr::filter(Gene %in% NDrisk$Hugo_Symbol)
+  expr.data <- melt(expr.data, id="Gene")
+  colnames(expr.data) <- c("Gene", "PATIENT_ID", "Zscore")
+  expr.data$PATIENT_ID <- sub("\\.[^.]*$", "",expr.data$PATIENT_ID)
+  expr.data$Expression[expr.data$Zscore > 1.5] = "Increased" 
+  expr.data$Expression[expr.data$Zscore < -1.5] = "Decreased"
+  expr.data <- expr.data  %>% dplyr::select(-c("Zscore")) %>% drop_na()
+  return(expr.data)}
+
+# Cox proportional hazard regression modeling
+fxn <- function(data){
+  tryCatch({
+    k <- get(paste(data))
+    cancer <- gsub("\\..*","",data)
+    cna <- k[["cna.data"]] %>% dplyr::rename(Group = CN) %>% 
+         filter(Group %in% c("Copy number gain", "Hemizygous deletion",'Unaltered')) %>% drop_na()
+    mut <- k[["mut.data"]] %>% dplyr::select(c("Hugo_Symbol" ,"Tumor_Sample_Barcode","Variant_Classification")) %>% 
+      dplyr::rename(Group = Variant_Classification)
+    df <- dplyr::left_join(cna,mut,by="Tumor_Sample_Barcode")
+    df[is.na(df)] <- "NA"
+    df <- df %>% filter(Group.y == "NA") %>% dplyr::select(c(1:3)) %>% 
+      dplyr::rename(Hugo_Symbol=Hugo_Symbol.x) %>% dplyr::rename(Group = Group.x)
+    clin.data <- k[["clin.data"]] 
+    k <- list()
+  for (gene in unique(df$Hugo_Symbol)){
+    OS.data <- filter(df, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) 
+    OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+    OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+  if (length(unique(OS.data$Group)) < 3) {cng.hem <- data.frame(term = rep(c("Grouphem")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),hem_median=c(NA), cng_median=c(NA))} else{
+    OS.data.cnghem <-OS.data %>% dplyr::filter(Group != "Unaltered")
+    OS.data.cnghem[OS.data.cnghem == "Hemizygous deletion"] <- "hem"
+    OS.data.cnghem[OS.data.cnghem == "Copy number gain"] <- "cng"
+    OS.data.cnghem$Group <- factor(OS.data.cnghem$Group, levels = c("cng","hem"))
+    dd <- OS.data.cnghem %>% group_by(Group) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Group,values_from = x)
+    if (dd$hem < 15 | dd$cng < 15){cng.hem <- data.frame(term = rep(c("Grouphem")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),hem_median=c(NA), cng_median=c(NA))} else {
+    surv = Surv(time = OS.data.cnghem$OS_MONTHS, event = as.numeric(OS.data.cnghem$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data.cnghem)
+    ww <- surv_median(fit)
+    ww[is.na(ww)] <- max(OS.data.cnghem$OS_MONTHS)
+    if (length(unique(OS.data.cnghem$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    a <- coxph(formula = surv ~ (Group + AGE), OS.data.cnghem)} else {
+    a <- coxph(formula = surv ~ (Group + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data.cnghem)}
+    cng.hem <- tidy(a, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "Grouphem") %>%
+      dplyr::select(-c(std.error,statistic)) %>% dplyr::mutate(hem_median = ww[2,2]) %>% dplyr::mutate(cng_median = ww[1,2])}
+    name <- paste0(gene,sep="_",cancer)
+    k[[name]] <- cng.hem
+    colnames(k[[name]]) <- c("contrast","HR","pval",'CI_lower','CI_upper','hem_median','cng_median')
+    k[[name]]$Gene = gene
+    k[[name]]$tumor = cancer}}
+  k <- do.call(rbind,k) %>% tibble::remove_rownames()}, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  return(k)}
+
+fxn.expr <- function(data){
+  tryCatch({
+    k <- get(paste(data))
+    cancer <- gsub("\\..*","",data)
+    expr.data <- k[["expr.data"]]
+    clin.data <- k[["clin.data"]] 
+    k <- list()
+  for (gene in unique(expr.data$Gene)){
+    OS.data <- filter(expr.data, Gene == gene) %>% dplyr::select(-c(1)) 
+    colnames(OS.data) <- c('Tumor_Sample_Barcode', 'Expression')
+    OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+    OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+    OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+  if (length(unique(OS.data$Expression)) < 2) {dd <- data.frame(term = rep(c("ExpressionDecreased")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),D_median=c(NA), I_median=c(NA))} else{
+    OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased","Decreased"))
+    dd <- OS.data %>% group_by(Expression) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Expression,values_from = x)
+    if (dd$Decreased < 15 | dd$Increased < 15){dd <- data.frame(term = rep(c("ExpressionDecreased")),estimate =c(NA),p.value=c(NA),CI_lower=c(NA),
+                                      CI_upper=c(NA),D_median=c(NA), I_median=c(NA))} else {
+    surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Expression, data=OS.data)
+    ww <- surv_median(fit)
+    ww[is.na(ww)] <- max(OS.data$OS_MONTHS)
+    if (length(unique(OS.data$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    a <- coxph(formula = surv ~ (Expression + AGE), OS.data)} else {
+    a <- coxph(formula = surv ~ (Expression + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data)}
+    dd <- tidy(a, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "ExpressionDecreased") %>%
+      dplyr::select(-c(std.error,statistic)) %>% dplyr::mutate(D_median = ww[2,2]) %>% dplyr::mutate(I_median = ww[1,2])}
+    name <- paste0(gene,sep="_",cancer)
+    k[[name]] <- dd
+    colnames(k[[name]]) <- c("contrast","HR","pval",'CI_lower','CI_upper','D_median','I_median')
+    k[[name]]$Gene = gene
+    k[[name]]$tumor = cancer}}
+  k <- do.call(rbind,k) %>% tibble::remove_rownames()}, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  return(k)}
+
+# Prep ND-related genes
+setwd(workPath)
+df <-  read.table(paste0(workPath,"ND.related.genes.txt"),header = T)
+df <- data.frame(Gene = c(df[!duplicated(df$Genes),]))
+NDrisk <- bitr(df$Gene, fromType = "SYMBOL",toType = c("ENTREZID"), 
+               OrgDb = org.Hs.eg.db) %>% 
+  drop_na() %>%  dplyr::select(-c(ENTREZID)) %>% rename(Hugo_Symbol=SYMBOL)
+```
+
+### Prepare TCGA data
+```{r warning=FALSE,message=FALSE}
+setwd(workPath)
+brainLGG.data <- tcga.prep("lgg_tcga")
+brainGBM.data <- tcga.prep("gbm_tcga")
+bladder.data <- tcga.prep("blca_tcga")
+breast.data <- tcga.prep("brca_tcga")
+cervical.data <- tcga.prep("cesc_tcga")
+colorectal.data <- tcga.prep("coadread_tcga")
+kidney.data <- tcga.prep("kirc_tcga")
+liver.data <- tcga.prep("lihc_tcga")
+lung.data <- tcga.prep("luad_tcga")
+ovarian.data <- tcga.prep("ov_tcga")
+pancreatic.data <- tcga.prep("paad_tcga")
+prostate.data <- tcga.prep("prad_tcga")
+thyroid.data <- tcga.prep("thca_tcga")
+skin.data <- tcga.prep("skcm_tcga")
+endometrial.data <- tcga.prep("ucec_tcga")
+sarcoma.data <- tcga.prep("sarc_tcga")
+stomach.data <- tcga.prep("stad_tcga")
+headneck.data <- tcga.prep("hnsc_tcga")
+# Prep clinical TCGA data
+brainLGG.data[["clin.data"]] <- tcga.clin.data.prep("lgg_tcga")
+brainGBM.data[["clin.data"]]  <- tcga.clin.data.prep("gbm_tcga")
+bladder.data[["clin.data"]] <- tcga.clin.data.prep("blca_tcga")
+breast.data[["clin.data"]] <- tcga.clin.data.prep("brca_tcga")
+cervical.data[["clin.data"]] <- tcga.clin.data.prep("cesc_tcga")
+colorectal.data[["clin.data"]] <- tcga.clin.data.prep("coadread_tcga")
+kidney.data[["clin.data"]] <- tcga.clin.data.prep("kirc_tcga")
+liver.data[["clin.data"]] <- tcga.clin.data.prep("lihc_tcga")
+lung.data[["clin.data"]] <- tcga.clin.data.prep("luad_tcga")
+ovarian.data[["clin.data"]] <- tcga.clin.data.prep("ov_tcga")
+pancreatic.data[["clin.data"]] <- tcga.clin.data.prep("paad_tcga")
+prostate.data[["clin.data"]] <- tcga.clin.data.prep("prad_tcga")
+thyroid.data[["clin.data"]] <- tcga.clin.data.prep("thca_tcga")
+skin.data[["clin.data"]] <- skcm.tcga.clin.data.prep("skcm_tcga")
+endometrial.data[["clin.data"]] <- tcga.clin.data.prep("ucec_tcga")
+sarcoma.data[["clin.data"]] <- tcga.clin.data.prep("sarc_tcga")
+stomach.data[["clin.data"]] <- tcga.clin.data.prep("stad_tcga")
+headneck.data[["clin.data"]] <- tcga.clin.data.prep("hnsc_tcga")
+# Prep gene expression TCGA data
+brainLGG.data[["expr.data"]] <- tcga.expr.prep("lgg_tcga")
+brainGBM.data[["expr.data"]]  <- tcga.expr.prep("gbm_tcga")
+bladder.data[["expr.data"]] <- tcga.expr.prep("blca_tcga")
+breast.data[["expr.data"]] <- tcga.expr.prep("brca_tcga")
+cervical.data[["expr.data"]] <- tcga.expr.prep("cesc_tcga")
+colorectal.data[["expr.data"]] <- tcga.expr.prep("coadread_tcga")
+kidney.data[["expr.data"]] <- tcga.expr.prep("kirc_tcga")
+liver.data[["expr.data"]] <- tcga.expr.prep("lihc_tcga")
+lung.data[["expr.data"]] <- tcga.expr.prep("luad_tcga")
+ovarian.data[["expr.data"]] <- tcga.expr.prep("ov_tcga")
+pancreatic.data[["expr.data"]] <- tcga.expr.prep("paad_tcga")
+prostate.data[["expr.data"]] <- tcga.expr.prep("prad_tcga")
+thyroid.data[["expr.data"]] <- tcga.expr.prep("thca_tcga")
+skin.data[["expr.data"]] <- tcga.expr.prep("skcm_tcga")
+endometrial.data[["expr.data"]] <- tcga.expr.prep("ucec_tcga")
+sarcoma.data[["expr.data"]] <- tcga.expr.prep("sarc_tcga")
+stomach.data[["expr.data"]] <- tcga.expr.prep("stad_tcga")
+headneck.data[["expr.data"]] <- tcga.expr.prep("hnsc_tcga")
+
+```
+
+### Calculate alteration frequency for ND-genes
+```{r warning=FALSE,message=FALSE}
+# Re-shape them
+bb <- c("breast.data", "bladder.data", "brainLGG.data", "brainGBM.data", "cervical.data", "colorectal.data",
+        "endometrial.data","kidney.data","liver.data","lung.data","ovarian.data",
+        "pancreatic.data","prostate.data","thyroid.data", "stomach.data",
+       "headneck.data", "sarcoma.data","skin.data")
+
+# Prep data for frequency calculation. Loop for each tumor type
+alt.frq <- list()
+for(data in bb){
+  df1 <- get(paste(data))
+  df  <- rbind((df1[["mut.data"]] %>% 
+                  select("Hugo_Symbol","Tumor_Sample_Barcode", "Variant_Classification") %>%
+                  rename(Alt=Variant_Classification)),
+  (df1[["cna.data"]] %>% select("Hugo_Symbol","Tumor_Sample_Barcode", "CN") %>% rename(Alt=CN)))
+df$cancer <- gsub("\\..*","", data)
+# Calculate alteration frequencies
+k <- df %>% group_by(Hugo_Symbol,Alt,cancer) %>% summarise(x = length(unique(Tumor_Sample_Barcode))) %>% 
+  filter(Alt != "Unaltered") %>% mutate(freq = (x/(length(unique(df$Tumor_Sample_Barcode))) * 100))
+alt.frq[[data]] <- k}
+alt.frq <- do.call(rbind,alt.frq)
+```
+
+### Cox proportionhal hazard modeling
+```{r message=FALSE,warning=FALSE}
+#Perform cox modeling for each tumor subtype
+# # breast
+breast.data[["surv"]] <- fxn("breast.data")
+breast.data[["surv.expr"]] <- fxn.expr("breast.data")
+# glioma
+brainLGG.data[["surv"]] <- fxn("brainLGG.data")
+brainLGG.data[["surv.expr"]] <- fxn.expr("brainLGG.data")
+brainGBM.data[["surv"]] <- fxn("brainGBM.data")
+brainGBM.data[["surv.expr"]] <- fxn.expr("brainGBM.data")
+# bladder
+bladder.data[["surv"]] <- fxn("bladder.data")
+bladder.data[["surv.expr"]] <- fxn.expr("bladder.data")
+# cervical
+cervical.data[["surv"]] <- fxn("cervical.data")
+cervical.data[["surv.expr"]] <- fxn.expr("cervical.data")
+# endometrial
+endometrial.data[["surv"]]  <- fxn("endometrial.data")
+endometrial.data[["surv.expr"]]  <- fxn.expr("endometrial.data")
+# headneck
+headneck.data[["surv"]]  <- fxn("headneck.data")
+headneck.data[["surv.expr"]]  <- fxn.expr("headneck.data")
+# kidney
+kidney.data[["surv"]] <- fxn("kidney.data")
+kidney.data[["surv.expr"]] <- fxn.expr("kidney.data")
+# liver
+liver.data[["surv"]] <- fxn("liver.data")
+liver.data[["surv.expr"]] <- fxn.expr("liver.data")
+# lung
+lung.data[["surv"]] <- fxn("lung.data")
+lung.data[["surv.expr"]] <- fxn.expr("lung.data")
+# ovarian
+ovarian.data[["surv"]]  <- fxn("ovarian.data")
+ovarian.data[["surv.expr"]]  <- fxn.expr("ovarian.data")
+# pancreatic
+pancreatic.data[["surv"]]  <- fxn("pancreatic.data")
+pancreatic.data[["surv.expr"]]  <- fxn.expr("pancreatic.data")
+# prostate
+prostate.data[["surv"]] <- fxn("prostate.data")
+prostate.data[["surv.expr"]] <- fxn.expr("prostate.data")
+# pancreatic
+pancreatic.data[["surv"]] <- fxn("pancreatic.data")
+pancreatic.data[["surv.expr"]] <- fxn.expr("pancreatic.data")
+# sarcoma
+sarcoma.data[["surv"]] <- fxn("sarcoma.data")
+sarcoma.data[["surv.expr"]] <- fxn.expr("sarcoma.data")
+# stomach
+stomach.data[["surv"]] <- fxn("stomach.data")
+stomach.data[["surv.expr"]] <- fxn.expr("stomach.data")
+# thyroid
+thyroid.data[["surv"]] <- fxn("thyroid.data")
+thyroid.data[["surv.expr"]] <- fxn.expr("thyroid.data")
+# skin
+skin.data[["clin.data"]]$HISTOLOGICAL_DIAGNOSIS <- "Melanoma"
+skin.data[["surv"]]  <- fxn("skin.data")
+skin.data[["surv.expr"]]  <- fxn.expr("skin.data")
+
+## Prep cox p-values for hemizygous deletion and copy number gain
+cox.data <- rbind(breast.data[["surv"]],brainLGG.data[["surv"]],
+              brainGBM.data[["surv"]],bladder.data[["surv"]],endometrial.data[["surv"]],
+              headneck.data[["surv"]],kidney.data[["surv"]],liver.data[["surv"]],lung.data[["surv"]],
+              ovarian.data[["surv"]],sarcoma.data[["surv"]],skin.data[["surv"]],
+              stomach.data[["surv"]],cervical.data[["surv"]])
+cox.data[cox.data == "Inf"] <- NA
+cox.data <- cox.data %>% dplyr::mutate(adj.pval = p.adjust(cox.data$pval,method="BH")) %>% drop_na() %>% 
+  dplyr::filter(pval != 0) %>% dplyr::filter(HR < 1e+1) %>% dplyr::filter(HR > 1e-5)  %>% dplyr::filter(pval > 1e-10) %>% 
+  dplyr::mutate(median_diff = abs(hem_median-cng_median)) %>% dplyr::mutate(median_ratio = hem_median/cng_median)
+cox.data$id <- paste(cox.data$Gene,cox.data$tumor,sep= ".")
+cox.data[ cox.data == "Grouphem"] <- 'hem/cng'
+
+# Prep cox for expr cox stats
+cox.data.expr <- rbind(breast.data[["surv.expr"]],brainLGG.data[["surv.expr"]],
+              brainGBM.data[["surv.expr"]],bladder.data[["surv.expr"]],endometrial.data[["surv.expr"]],
+              headneck.data[["surv.expr"]],kidney.data[["surv.expr"]],liver.data[["surv.expr"]],lung.data[["surv.expr"]],
+              ovarian.data[["surv.expr"]],sarcoma.data[["surv.expr"]],skin.data[["surv.expr"]],
+              stomach.data[["surv.expr"]],cervical.data[["surv.expr"]])
+cox.data.expr[cox.data.expr == "Inf"] <- NA
+cox.data.expr <- drop_na(cox.data.expr)
+cox.data.expr$id <- paste(cox.data.expr$Gene,cox.data.expr$tumor,sep= ".")
+cox.data.expr[cox.data.expr == "GroupDecreased"] <- 'Decreased/Increased'
+#cox.data.expr <- cox.data.expr %>% filter(median_diff > 5)
+# Test for proportionality assumption for cox model
+# cox.zph(cox_reg_model)
+```
+
+## Alteration Profiles {.tabset}
+### Types & Frequencies of alterations
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+# Read frequency summary files
+setwd(paste0(workPath,"mutation/"))
+files <- list.files(getwd(), pattern ="*_summary.txt")
+df <- map(files, .f=read.delim)
+df <- do.call(rbind,df)
+df <- df %>% group_by(Alteration.Type,Cancer.Type) %>% summarise(freq = mean(Alteration.Frequency)) %>% 
+  dplyr::filter(Alteration.Type != "multiple")
+df$Type <- "Types of alterations seen in ND-related \n genes across 17 different tumors"
+# Prep summary freq file
+df[df == "amp"] <- "Copy number amplification (+2)"
+df[df == "gain"] <- "Copy number gain (+1)"
+df[df == "hetloss"] <- "Hemizygous deletion (-1)"
+df[df == "homdel"] <- "Deep deletion (-2)"
+df[df == "mutated"] <- "Mutation"
+
+# Plot
+my_cols = c("#440154FF","#39568CFF","#7AD151FF","#1F988BFF","grey")
+names(my_cols) = c('Hemizygous deletion (-1)','Copy number gain (+1)','Deep deletion (-2)', 'Copy number amplification (+2)',"Mutation")
+df$Alteration.Type <- factor(df$Alteration.Type , levels = c("Hemizygous deletion (-1)","Copy number gain (+1)", 
+                                                             "Copy number amplification (+2)", "Deep deletion (-2)","Mutation"))
+ND.alt.plt <- ggplot(df, aes(freq,Cancer.Type,fill=Alteration.Type)) + 
+      geom_bar(stat = "identity") + theme_classic(base_size = 20) + xlab("Alteration Frequency (%)") + 
+      ylab("") + theme(panel.border = element_rect(size = 1, fill = NA)) + facet_wrap(~Type) +
+      scale_fill_manual(values = my_cols, aesthetics = "fill")
+ND.alt.plt
+```
+
+### Profile on non-copy number alteration
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+mut.alt <- alt.frq %>% filter(!Alt %in% c("Copy number gain", "Hemizygous deletion","Copy number amplification",
+                                          "Deep deletion"))
+mut.alt <- mut.alt[order(-mut.alt$freq),]
+mut.alt$Change <- "NS"
+mut.alt$Change[mut.alt$freq > 5.2] <- "S" # select genes with > 5% mutation freq
+mut.alt$delabel <- NA
+mut.alt$label <- "Mutation profile of ND-related genes \n across 17 cancer types"
+mut.alt$delabel[mut.alt$Change != "NS"] <- mut.alt$Hugo_Symbol[mut.alt$Change != "NS"]
+mut.alt.plt <- ggplot(mut.alt,aes(cancer,freq, color = Alt, label=delabel)) + geom_point() + 
+    theme_classic(base_size = 20) + #scale_color_viridis_d() + 
+    geom_label_repel()+ theme(panel.border = element_rect(size = 1, fill = NA)) + 
+  xlab("") +  ylab("Mutation Frequency (%)") +  labs(color='Mutation Type') + coord_flip() +
+  facet_wrap(~label, scales = "free") 
+mut.alt.plt
+```
+
+### Profile of copy number alteration profile 
+```{r warning=FALSE,message=FALSE,  fig.width=23, fig.height=10}
+# Pull cna and mut data for all tumors
+bb <- c("breast.data", "bladder.data", "brainLGG.data","brainGBM.data" , "cervical.data", 
+        "colorectal.data", "endometrial.data","kidney.data",
+        "liver.data","lung.data","ovarian.data", "pancreatic.data","prostate.data","thyroid.data",
+        "stomach.data","headneck.data", "sarcoma.data","skin.data")
+alt.data <- list()  # stores data
+alt.meta <- list()  # stores metadata
+for(data in bb){ #function to run prep
+  df1 <- get(paste(data))
+  df  <- rbind((df1[["mut.data"]] %>% select("Tumor_Sample_Barcode","Hugo_Symbol","Variant_Classification") %>%
+  rename(Alt=Variant_Classification)),
+  (df1[["cna.data"]] %>% select("Tumor_Sample_Barcode","Hugo_Symbol","CN") %>%
+  rename(Alt=CN))) %>% rename("Patient"="Tumor_Sample_Barcode") %>% rename("Gene"="Hugo_Symbol")
+k <- df %>% filter(Alt %in% c("Hemizygous deletion","Copy number gain", "Copy number amplification","Deep deletion","Unaltered")) 
+k$Alt <- gsub("Unaltered", 0, k$Alt)
+k$Alt <- gsub("Hemizygous deletion", -1, k$Alt)
+k$Alt <- gsub("Copy number amplification", +2, k$Alt)
+k$Alt <- gsub("Deep deletion", -2, k$Alt)
+k$Alt <- gsub("Copy number gain", +1, k$Alt)
+k$Alt <- as.numeric(k$Alt)
+kk <- k %>% pivot_wider(names_from = "Gene",values_from = "Alt")
+kk$Patient <- sub(".01", "",kk$Patient)
+kk$Patient <- sub(".06", "",kk$Patient)
+kk <- kk[!duplicated(kk$Patient),]
+
+# Prep pheno
+if(data == "skin.data"){pheno <- df1[["clin.data"]] %>% dplyr::select(-c("HISTOLOGICAL_DIAGNOSIS")) %>% 
+  dplyr::rename(Patient = Tumor_Sample_Barcode)} else {
+pheno <- df1[["clin.data"]] %>% select(-c(HISTOLOGICAL_DIAGNOSIS)) %>% rename(Patient = Tumor_Sample_Barcode)}
+pheno <- pheno %>% dplyr::select(-c(OS_MONTHS)) %>% rename(Age=AGE) %>% rename(Race=RACE) %>% rename(Sex=SEX) %>% rename(Status=OS_STATUS)
+pheno$Status <- gsub("0","Living",pheno$Status)
+pheno$Status <- gsub("1","Deceased",pheno$Status)
+pheno$cancer <- gsub("\\..*","", data)
+pheno$Patient <- gsub("-", ".",pheno$Patient)
+pheno$Age <- as.numeric(pheno$Age)
+pheno[pheno == "MALE"] <- "Male"
+pheno[pheno == "[NOT AVAILABLE]"] <- "NA"
+alt.data[[data]] <- kk
+alt.meta[[data]] <- pheno}
+# Combine
+alt.data1 <- do.call(rbind,alt.data) %>% remove_rownames() %>% column_to_rownames("Patient")
+alt.meta1 <- do.call(rbind,alt.meta) %>% remove_rownames() %>% drop_na() %>%  column_to_rownames("Patient")
+idx <- match(rownames(alt.data1),rownames(alt.meta1))
+alt.meta1 <- alt.meta1[idx,] %>% drop_na()
+idx <- match(rownames(alt.meta1),rownames(alt.data1))
+alt.data1 <- alt.data1[idx,] 
+# Plot heatmap
+set.seed(401)
+hm <- pheatmap(alt.data1,cluster_rows = T, cluster_cols=T,
+                      show_rownames = F, fontsize = 14, fontsize_col = 8, annotation_row = alt.meta1,
+                      name = "Alteration Status",show_colnames = T, na_col = "grey",
+                      main = "Copy number alteration profile of ND-related genes \n across 17 cancer types")
+hm
+```
+
+## Top altered ND-related genes {.tabset}
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+deepdel.df <- alt.frq %>% filter(Alt == "Deep deletion") %>% 
+  group_by(Hugo_Symbol,cancer) %>% summarise(freq = sum(freq)) %>% 
+  pivot_wider(names_from = cancer, values_from = freq) %>%  
+  filter(Hugo_Symbol %in% c("APOE", "CD33", "SNCA","BIN1","ABCA7","CRI","PICALM","MS4A64","ACMSD","AGRN",
+                      "MS4A4E","CD2AP","PSEN1","PSEN2","APP","MAPT","LRRK2","GBA","GRN","TREM2","INPP5D")) %>% 
+  column_to_rownames('Hugo_Symbol')
+# Generate heatmap
+deepdel.hm <- pheatmap(deepdel.df, angle_col = c("315"), show_colnames = T, # color = viridis(20),
+                       name = "AF (%)",cluster_rows = F, cluster_cols=F,
+                        show_rownames = T, fontsize_row = 12, fontsize_col = 14, na_col = "#DDDDDD",
+                       main = "Deep deletion (-2) profile of some top \n ND-related genes  among TCGA cancer cohorts")
+
+hem.df <- alt.frq %>% filter(Alt == "Hemizygous deletion") %>% 
+  group_by(Hugo_Symbol,cancer) %>% summarise(freq = sum(freq)) %>% 
+  pivot_wider(names_from = cancer, values_from = freq) %>%  
+  filter(Hugo_Symbol %in% c("APOE", "CD33", "SNCA","BIN1","ABCA7","CRI","PICALM","MS4A64","ACMSD","AGRN",
+                      "MS4A4E","CD2AP","PSEN1","PSEN2","APP","MAPT","LRRK2","GBA","GRN","TREM2","INPP5D")) %>% 
+  column_to_rownames('Hugo_Symbol')
+hem.df.hm <- pheatmap(hem.df, #color = viridis(20),
+                      cluster_rows = F, cluster_cols=F,show_rownames = T,
+                      fontsize_row = 12, fontsize_col = 14,
+                      na_col = "#DDDDDD", angle_col = c("315"), show_colnames = T, name = "AF (%)",
+                      main = "Hemizygous deletion (-1) profile of some top \n ND-related genes among TCGA cancer cohorts")
+
+cna.df <- alt.frq %>% filter(Alt == "Copy number amplification") %>% 
+  group_by(Hugo_Symbol,cancer) %>% summarise(freq = sum(freq)) %>% 
+  pivot_wider(names_from = cancer, values_from = freq) %>%  
+  filter(Hugo_Symbol %in% c("APOE", "CD33", "SNCA","BIN1","ABCA7","CRI","PICALM","MS4A64","ACMSD","AGRN",
+                      "MS4A4E","CD2AP","PSEN1","PSEN2","APP","MAPT","LRRK2","GBA","GRN","TREM2","INPP5D")) %>% 
+  column_to_rownames('Hugo_Symbol')
+# Generate heatmap
+cna.df.hm <- pheatmap(cna.df, #color = viridis(20),
+                      cluster_rows = F, cluster_cols=F,show_rownames = T, 
+                      fontsize_row = 12, fontsize_col = 14,
+                      na_col = "#DDDDDD", angle_col = c("315"), show_colnames = T, name = "AF (%)",
+                      main = "Copy number amplification (+2) profile of some top \n ND-related genes among TCGA cancer cohorts")
+
+cng.df <- alt.frq %>% filter(Alt == "Copy number gain") %>% 
+  group_by(Hugo_Symbol,cancer) %>% summarise(freq = sum(freq)) %>% 
+  pivot_wider(names_from = cancer, values_from = freq) %>%  
+  filter(Hugo_Symbol %in% c("APOE", "CD33", "SNCA","BIN1","ABCA7","CRI","PICALM","MS4A64","ACMSD","AGRN",
+                      "MS4A4E","CD2AP","PSEN1","PSEN2","APP","MAPT","LRRK2","GBA","GRN","TREM2","INPP5D")) %>% 
+  column_to_rownames('Hugo_Symbol')
+# Generate heatmap
+cng.df.hm <- pheatmap(cng.df, #color = viridis(20),
+                      cluster_rows = F, cluster_cols=F,show_rownames = T, 
+                      fontsize_row = 12, fontsize_col = 14,
+                      na_col = "#DDDDDD", angle_col = c("315"), show_colnames = T, name = "AF (%)",
+                      main = "Copy number gain (+1) profile of some top \n ND-related genes among TCGA cancer cohorts")
+```
+
+## Associations with survival? {.tabset}
+### Defining strong associations
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=5}
+# Volcano plot of gene associations with cancer survival
+df <- cox.data 
+df[df=="cng.non"] <- "Copy number gain"
+df[df=="hem.non"] <- "Hemizygous deletion"
+df$effect <- "Not significant"
+# define significant associations
+df$effect[df$HR > 1.2 & df$CI_lower > 1.1 & (df$hem_median < 60 | df$cng_median < 60) & 
+            (df$median_ratio > 3 | df$median_ratio < 0.3) & df$median_diff > 60] <- "cng = survival advantage"
+df$effect[df$HR < 0.8 & df$CI_upper < 0.9 & (df$hem_median < 60 | df$cng_median < 60) &  
+            (df$median_ratio > 3 | df$median_ratio < 0.3) & df$median_diff > 60] <- "hem = survival advantage"
+surv.data <- df %>% filter(effect != "Not significant")
+df$label <- "Copy number gain (cng) as reference"
+```
+
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=5}
+## Some visualizationd
+# Volcano
+assoc.volcano.plt <- ggplot(df,aes(HR,-log10(adj.pval), color=effect, size=median_diff)) + geom_point() + 
+  theme_classic(base_size = 15) + scale_color_manual(values = c("#39568CFF","#440154FF","lightgrey")) +  
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") + 
+  xlab("Hazard Ratio (HR)") + ylab("Significance: -log10(BH-corrected pvalue)") + 
+  labs(color='Association')  +  facet_wrap(~label,scales = "free") + #xlim(0,3.1) + 
+  ggtitle("Association of ND-related gene alterations \nwith cancer prognosis") 
+
+# Histogram
+df1 <- df %>% group_by(tumor,effect) %>% summarise(x = length(unique(Gene))) %>% 
+  dplyr::filter(effect!= 'Not significant')
+assoc.cts <- ggplot(df1, aes(x=reorder(tumor,x),y=x,fill=effect)) + geom_bar(stat = "identity",position = "stack") +
+  theme_classic(base_size = 15) +  scale_fill_manual(values = c("#39568CFF","#440154FF")) + coord_flip() +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") + 
+  ylab("Number of ND-related gene") + xlab('Tumor') + labs(fill='') +
+  ggtitle("Number of ND-related genes with strong \nprognostic implication in each tumor")
+
+```
+
+```{r warning=FALSE,message=FALSE, fig.width=23, fig.height=8}
+# Scatter plots of associations highlighting popular ND-related genes
+df <- cox.data
+df[df=="cng.non"] <- "Copy number gain"
+df[df=="hem.non"] <- "Hemizygous deletion"
+df$effect[df$HR > 1.2 & df$CI_lower > 1.1 & (df$hem_median < 60 | df$cng_median < 60) & 
+            (df$median_ratio > 3 | df$median_ratio < 0.3) & df$median_diff > 60] <- "cng = survival advantage"
+df$effect[df$HR < 0.8 & df$CI_upper < 0.9 & (df$hem_median < 60 | df$cng_median < 60) &  
+            (df$median_ratio > 3 | df$median_ratio < 0.3) & df$median_diff > 60] <- "hem = survival advantage"
+df <- df %>% drop_na()
+# plot
+assoc.scatter.plt <- ggplot(df,aes(HR,tumor,color=effect)) + geom_point(aes(size = -log10(adj.pval))) + 
+  theme_classic(base_size = 15) +  scale_color_manual(values = c("#39568CFF","#440154FF")) +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "right") +
+  ylab("") +  xlab("Hazard Ratio") + #facet_wrap(~effect,scales = "free") +
+  geom_label_repel(data = df %>% filter(Gene %in% c("SNCA", "MAPT", "TMEM175", "ASH1L", "MCCC1", "STK39", "BST1", "NCKS1", 
+                                                    "TMEM229B", "LRRK2", "HLA-DBQ1", "BCKDK", "INPP5F", "FAM47E", "RIT2", 
+                                                    "CCDC62", "SIPA1L2", "UBOX5", "TMPRSS9", "DLG2", "APOE", "BIN1", "CLU", "ABCA7", 
+                                                    "CR1", "PICALM", "MS4A6A", "MS4A4E", "CD33", "CD2AP", 'ACMSD')),
+                                        aes(label = Gene, x = HR, y = tumor)) +  labs(col='Association') +
+  ggtitle("Association of alterations in some top ND-related \ngenes with cancer prognosis") + xlim(0,6)
+
+```
+
+### GOI expression and tumor prognosis
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+df1 <- cox.data.expr %>% dplyr::select(c(HR,id)) %>% rename(alt.HR = HR)
+df2 <- surv.data %>% dplyr::select(c(HR,id)) %>% rename(expr.HR = HR)
+df <- left_join(df2,df1) %>% drop_na()
+df$effect <- 'NS'
+df$effect[df$alt.HR > 1.5 & df$expr.HR > 1.5] <- "CNG and high mRNA expression \nassociates with survival advantage"
+df$effect[df$alt.HR < 0.5 & df$expr.HR < 0.5] <- "HemDel and low mRNA expression \nassociates with survival advantage"
+df$delabel <- NA
+df$delabel[df$effect != "NS"] <- df$id[df$effect != "NS"]
+#df <- drop_na(df)
+assoc.cor <- ggplot(df, aes(x=alt.HR, y=expr.HR, label = delabel, color=effect)) + 
+  geom_point() +  scale_color_manual(values = c("#39568CFF","#440154FF","grey")) + 
+  theme_classic(base_size = 15) + geom_label_repel() + labs(col='') +
+  #facet_wrap(~effect,scales = 'free') +
+  theme(panel.border = element_rect(size = 1, fill = NA),legend.position = "top") +
+  xlab('Hazard ratio (HemDel/CNG)') + ylab('Hazard ratio (Low mRNA/High mRNA)')
+
+```
+
+### Survival curve: alt and exprs
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+ids <- c('BAG3.skin','STK39.lung','UNC5CL.sarcoma','CLU.headneck','SPPL2A.sarcoma','CASS4.cervical', 'DLG2.brainLGG','ADAM10.sarcoma','ATP8B4.sarcoma')
+for (ids in ids){
+data <- paste0((gsub("^[^.]*\\.","",ids)),".data")
+gene <- gsub("\\..*","",ids)
+k <- get(paste(data))
+cancer <- gsub("\\..*","",data)
+cna <- k[["cna.data"]] %>% dplyr::rename(Group = CN) %>% 
+      filter(Group %in% c("Copy number gain", "Hemizygous deletion")) %>% drop_na()
+cna$Tumor_Sample_Barcode <- gsub('[.]', '-', cna$Tumor_Sample_Barcode)
+cna$Tumor_Sample_Barcode <- sub("-01", "", cna$Tumor_Sample_Barcode)
+cna$Tumor_Sample_Barcode <- sub("-06", "", cna$Tumor_Sample_Barcode)
+expr.data <- k[["expr.data"]] %>% rename(Tumor_Sample_Barcode = PATIENT_ID) %>% 
+  rename(Hugo_Symbol = Gene) %>%  rename(Group = Expression)
+expr.data$Tumor_Sample_Barcode <- gsub('[.]', '-', expr.data$Tumor_Sample_Barcode)
+expr.data$Tumor_Sample_Barcode <- sub("-01", "", expr.data$Tumor_Sample_Barcode)
+expr.data$Tumor_Sample_Barcode <- sub("-06", "", expr.data$Tumor_Sample_Barcode)
+OS.data <- rbind(cna,expr.data)
+clin.data <- k[["clin.data"]]
+OS.data <- filter(OS.data, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) 
+OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+OS.data[OS.data == "Increased"] <- "High mRNA"
+OS.data[OS.data == "Decreased"] <- "Low mRNA"
+# Plot survival curve
+OS.data1 <- OS.data 
+OS.data1$Data[(OS.data1$Group == "Copy number gain") | (OS.data1$Group == "Hemizygous deletion")] <- 'Gene alteration'
+OS.data1$Data[(OS.data1$Group == "High mRNA") | (OS.data1$Group == "Low mRNA")] <- 'mRNA expression'
+OS.data1$Group <- factor(OS.data1$Group, levels = c("Copy number gain", "Hemizygous deletion","High mRNA", "Low mRNA"))
+surv.main <- Surv(time = OS.data1$OS_MONTHS, event = as.numeric(OS.data1$OS_STATUS))
+fit.main <- survival::survfit(formula = surv.main ~ Group, data=OS.data1)
+p <- ggsurvplot(fit = fit.main, pval = F, risk.table = F, fun = "pct", conf.int =F, break.x.by = 40,
+                xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+                risk.table.title="", ggtheme =  theme_classic(base_size = 15), #linetype = c("solid","dashed"),
+                palette = c("#39568CFF","#440154FF","darkgreen", "orange"), legend = "top", facet.by = "Data",
+                legend.labs = c("Copy number gain","Hemizygous deletion", "High mRNA", "Low mRNA"))
+name <- paste0(gene,sep="_",cancer)
+p <- p + theme(panel.border = element_rect(size = 1, fill = NA)) + labs(color='')
+p <- p + ggtitle(name)
+print(p)}
+```
+
+### Survival curve: alt 
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+ids <- c('APOE.brainLGG','RIT2.brainLGG','STK39.lung','ACMSD.lung','INPP5F.skin',
+         'CLU.headneck','BST1.bladder','PICALM.brainLGG','DLG2.brainLGG')
+for (ids in ids){
+data <- paste0((gsub("^[^.]*\\.","",ids)),".data")
+gene <- gsub("\\..*","",ids)
+k <- get(paste(data))
+cancer <- gsub("\\..*","",data)
+cna <- k[["cna.data"]] %>% dplyr::rename(Group = CN) %>% 
+      filter(Group %in% c("Copy number gain", "Hemizygous deletion")) %>% drop_na()
+cna$Tumor_Sample_Barcode <- gsub('[.]', '-', cna$Tumor_Sample_Barcode)
+cna$Tumor_Sample_Barcode <- sub("-01", "", cna$Tumor_Sample_Barcode)
+cna$Tumor_Sample_Barcode <- sub("-06", "", cna$Tumor_Sample_Barcode)
+OS.data <- cna
+clin.data <- k[["clin.data"]]
+OS.data <- filter(OS.data, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) 
+OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+# Plot survival curve
+OS.data1 <- OS.data 
+OS.data1$Group <- factor(OS.data1$Group, levels = c("Copy number gain","Hemizygous deletion"))
+surv.main <- Surv(time = OS.data1$OS_MONTHS, event = as.numeric(OS.data1$OS_STATUS))
+fit.main <- survival::survfit(formula = surv.main ~ Group, data=OS.data1)
+p <- ggsurvplot(fit = fit.main, pval = F, risk.table = F, fun = "pct", conf.int =F, break.x.by = 40,
+                xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+                risk.table.title="", ggtheme =  theme_classic(base_size = 15),
+                palette = c("#39568CFF","#440154FF"), legend = "top",
+                legend.labs = c("Copy number gain", "Hemizygous deletion"))
+OS.data.cnghem <-OS.data %>% dplyr::filter(Group != "Unaltered")
+OS.data.cnghem[OS.data.cnghem == "Hemizygous deletion"] <- "hem"
+OS.data.cnghem[OS.data.cnghem == "Copy number gain"] <- "cng"
+OS.data.cnghem$Group <- factor(OS.data.cnghem$Group, levels = c("cng","hem"))
+dd <- OS.data.cnghem %>% group_by(Group) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Group,values_from = x)
+# ww <- surv_median(fit.main)
+# ww[is.na(ww)] <- max(OS.data.cnghem$OS_MONTHS)
+if (dd$hem < 5 & dd$cng < 5){cng.hem <- data.frame(term = rep(c("Grouphem")), estimate = c(NA), p.value=c(NA))} else {
+    surv = Surv(time = OS.data.cnghem$OS_MONTHS, event = as.numeric(OS.data.cnghem$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data.cnghem)
+        if (length(unique(OS.data.cnghem$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    cng.hem <- coxph(formula = surv ~ (Group + AGE), OS.data.cnghem)} else {
+    cng.hem <- coxph(formula = surv ~ (Group + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data.cnghem)}
+    cng.hem <- tidy(cng.hem, exponentiate = T, conf.int = T, conf.level = 0.95) %>% dplyr::filter(term == "Grouphem") %>%
+      dplyr::select(-c(std.error,statistic))}
+name <- paste0(gene,sep="_",cancer)
+#kk <- rbind(cng,hem,cng.hem)
+colnames(cng.hem) <- c("contrast","HR", "p.value",'CI_lower','CI_upper','hem_median','cng_median')
+cng.hem[cng.hem == "Grouphem"] <- 'hem/cng'
+
+p$plot <- p$plot + theme(panel.border = element_rect(size = 1, fill = NA)) + labs(color='') +
+    annotation_custom(tableGrob(cng.hem,rows=NULL, theme=ttheme_minimal(base_size = 10)),
+                      (max(OS.data.cnghem$OS_MONTHS)/2), xmax=(max(OS.data.cnghem$OS_MONTHS)/2), ymin=3, ymax=5)
+p <- p + ggtitle(name)
+print(p)}
+```
+
+### Survival curve and forest plot ------ OLD CODE, INCLUDES Unaltered
+```{r warning=FALSE,message=FALSE, fig.width=16, fig.height=10}
+ids <- surv.data$id
+
+ids <- c("NOD2.breast", "RNF141.breast", 'CLNK.bladder', 'BST1.bladder', 'LCORL.bladder',
+'APOE.brainLGG', 'DLG2.brainLGG','CD33.headneck', 'ECHDC3.headneck', 'LILRB2.headneck', 'USP6NL.headneck',
+'RIT2.kidney', 'MEX3C.kidney', 'ASXL3.kidney', 'ALPK2.kidney','ACMSD.lung', 'SYT17.lung',
+'CD2AP.sarcoma', 'TREM2.sarcoma', 'TREML2.sarcoma', 'UNC5CL.sarcoma')
+
+for (ids in ids){
+data <- paste0((gsub("^[^.]*\\.","",ids)),".data")
+gene <- gsub("\\..*","",ids)
+k <- get(paste(data))
+cancer <- gsub("\\..*","",data)
+cna <- k[["cna.data"]] %>% dplyr::rename(Group = CN) %>% 
+      filter(Group %in% c("Copy number gain", "Hemizygous deletion","Unaltered")) %>% drop_na()
+mut <- k[["mut.data"]] %>% dplyr::select(c("Hugo_Symbol" ,"Tumor_Sample_Barcode","Variant_Classification")) %>% 
+  dplyr::rename(Group = Variant_Classification)
+df <- dplyr::left_join(cna,mut,by="Tumor_Sample_Barcode")
+df[is.na(df)] <- "NA"
+df <- df %>% filter(Group.y == "NA") %>% dplyr::select(c(1:3)) %>% 
+  dplyr::rename(Hugo_Symbol=Hugo_Symbol.x) %>% dplyr::rename(Group = Group.x)
+clin.data <- k[["clin.data"]]
+OS.data <- filter(df, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) 
+OS.data$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data$Tumor_Sample_Barcode)
+OS.data$Tumor_Sample_Barcode <- sub("-01", "", OS.data$Tumor_Sample_Barcode)
+OS.data$Tumor_Sample_Barcode <- sub("-06", "", OS.data$Tumor_Sample_Barcode)
+OS.data <- left_join(OS.data, clin.data) %>% drop_na() 
+OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+OS.data1 <- OS.data
+OS.data1$Group <- factor(OS.data1$Group, levels = c("Unaltered","Copy number gain","Hemizygous deletion"))
+surv.main = Surv(time = OS.data1$OS_MONTHS, event = as.numeric(OS.data1$OS_STATUS))
+fit.main <- survival::survfit(formula = surv.main ~ Group, data=OS.data1)
+if (!"Copy number gain" %in% OS.data$Group){
+  cng <- data.frame(term = rep(c("cng/non")), estimate = c(NA), p.value=c(NA))} else{
+    OS.data.cng <- OS.data %>% dplyr::filter(Group != "Hemizygous deletion")
+    OS.data.cng[OS.data.cng == "Copy number gain"] <- "cng"
+    OS.data.cng[OS.data.cng == "Unaltered"] <- "non"
+    OS.data.cng$Group <- factor(OS.data.cng$Group, levels = c("non","cng"))
+    dd <- OS.data.cng %>% group_by(Group) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Group,values_from = x)
+    if (dd$non < 10 | dd$cng < 10){cng <- data.frame(term = rep(c("cng/non")), estimate = c(NA), p.value=c(NA))} else {
+    surv = Surv(time = OS.data.cng$OS_MONTHS, event = as.numeric(OS.data.cng$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data.cng)
+    if (length(unique(OS.data.cng$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    cng <- coxph(formula = surv ~ (Group + AGE), OS.data.cng)} else {
+    cng <- coxph(formula = surv ~ (Group + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data.cng)}
+    cng <- tidy(cng, exponentiate = TRUE) %>% dplyr::filter(term == "Groupcng") %>% dplyr::select(c(term,estimate,p.value))
+    cng <- data.frame(term = rep(c("cng/non")), estimate = c(cng$estimate), p.value=c(cng$p.value))}}
+
+if (!"Hemizygous deletion" %in% OS.data$Group){
+  hem <- data.frame(term = rep(c("hem/non")), estimate = c(NA), p.value=c(NA))} else{
+    OS.data.hem <-OS.data %>% dplyr::filter(Group != "Copy number gain")
+    OS.data.hem[OS.data.hem == "Hemizygous deletion"] <- "hem"
+    OS.data.hem[OS.data.hem == "Unaltered"] <- "non"
+    OS.data.hem$Group <- factor(OS.data.hem$Group, levels = c("non","hem"))
+    dd <- OS.data.hem %>% group_by(Group) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Group,values_from = x)
+    if (dd$non < 10 | dd$hem < 10){cng <- data.frame(term = rep(c("hem/non")), estimate = c(NA), p.value=c(NA))} else {
+    surv = Surv(time = OS.data.hem$OS_MONTHS, event = as.numeric(OS.data.hem$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data.hem)
+    if (length(unique(OS.data.hem$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    hem <- coxph(formula = surv ~ (Group + AGE), OS.data.hem)} else {
+    hem <- coxph(formula = surv ~ (Group + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data.hem)}
+    hem <- tidy(hem, exponentiate = TRUE) %>% dplyr::filter(term == "Grouphem") %>% dplyr::select(c(term,estimate,p.value))
+    hem <- data.frame(term = rep(c("hem/non")), estimate = c(hem$estimate), p.value=c(hem$p.value))}}
+
+if (length(unique(OS.data$Group)) < 3) {
+    cng.hem <- data.frame(term = rep(c("cng/hem")), estimate = c(NA), p.value=c(NA))} else{
+    OS.data.cnghem <-OS.data %>% dplyr::filter(Group != "Unaltered")
+    OS.data.cnghem[OS.data.cnghem == "Hemizygous deletion"] <- "hem"
+    OS.data.cnghem[OS.data.cnghem == "Copy number gain"] <- "cng"
+    OS.data.cnghem$Group <- factor(OS.data.cnghem$Group, levels = c("cng","hem"))
+    dd <- OS.data.cnghem %>% group_by(Group) %>% summarise(x = length(unique((Tumor_Sample_Barcode)))) %>%
+            pivot_wider(names_from = Group,values_from = x)
+    if (dd$hem < 10 | dd$cng < 10){cng.hem <- data.frame(term = rep(c("cng/hem")), estimate = c(NA), p.value=c(NA))} else {
+    surv = Surv(time = OS.data.cnghem$OS_MONTHS, event = as.numeric(OS.data.cnghem$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data.cnghem)
+        if (length(unique(OS.data.cnghem$HISTOLOGICAL_DIAGNOSIS)) < 2){
+    cng.hem <- coxph(formula = surv ~ (Group + AGE), OS.data.cnghem)} else {
+    cng.hem <- coxph(formula = surv ~ (Group + AGE + HISTOLOGICAL_DIAGNOSIS), OS.data.cnghem)}
+    cng.hem <- tidy(cng.hem, exponentiate = TRUE) %>% dplyr::filter(term == "Grouphem") %>%
+      dplyr::select(c(term,estimate,p.value))
+    cng.hem <- data.frame(term = rep(c("hem/cng")), estimate = c(cng.hem$estimate), p.value=c(cng.hem$p.value))}}
+
+name <- paste0(gene,sep="_",cancer)
+kk <- rbind(cng,hem,cng.hem)
+colnames(kk) <- c("contrast","HR", "p.value")
+p <- ggsurvplot(fit = fit.main, pval = F, risk.table = T, fun = "pct", conf.int =T, xlim = c(0,150), break.x.by = 20,
+        xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+        risk.table.title="", ggtheme =  theme_classic(base_size = 15),
+        palette = c("#808080","#39568CFF","#440154FF"), legend = "none")
+        #legend.labs = c("Unaltered (non)", "Copy number gain (cng)", "Hemizygous deletion (hem)"))
+p$plot <- p$plot + labs(color='') + theme(panel.border = element_rect(size = 1, fill = NA)) +
+  annotation_custom(tableGrob(kk,rows=NULL, theme=ttheme_minimal(base_size = 10)),xmin=10, xmax=30, ymin=10, ymax=25)
+p <- p + ggtitle(name)
+print(p)}
+```
+
+```{r save}
+# Save & Load session
+save.image("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/manuscript/neuro_onco/Mutation.Rdata")
+```
